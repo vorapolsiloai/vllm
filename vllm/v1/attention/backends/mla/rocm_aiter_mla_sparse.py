@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -16,6 +17,7 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
     SparseMLACommonMetadata,
     SparseMLACommonMetadataBuilder,
+    SparseMLAPrefillMetadata,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -619,6 +621,12 @@ def _index_epoch(buf: object, owns_indexer: bool) -> int:
     return epoch
 
 
+# Below this many dense-eligible tokens per step the dense pass (cache gather,
+# kv_b up-projection, flash attention, scatter) costs more than the sparse
+# rows it empties: those tokens still run the MQA path, with zero keys.
+_DENSE_PREFIX_MIN_TOKENS = 6144
+
+
 @dataclass(kw_only=True)
 class ROCMAiterMLASparseMetadata(SparseMLACommonMetadata):
     qo_indptr: torch.Tensor | None = None
@@ -642,6 +650,11 @@ class ROCMAiterMLASparseMetadata(SparseMLACommonMetadata):
     reduce_indptr: torch.Tensor | None = None
     reduce_final_map: torch.Tensor | None = None
     reduce_partial_map: torch.Tensor | None = None
+
+    # VLLM_ROCM_SPARSE_MLA_DENSE_PREFIX: (token ids, their (block, offset) in
+    # the cache, this metadata with their dense MHA prefill). They get no keys
+    # in the sparse stream.
+    dense_prefix: tuple | None = None
 
 
 @dataclass
@@ -784,6 +797,16 @@ class ROCMAiterMLASparseMetadataBuilder(
         self._prev_req_extent: int = 0
         self._prev_indices_extent: int = 0
         self._prev_metadata_key: tuple | None = None
+        self._dense_prefix_backend = (
+            self._prefill_backend.clone()
+            if envs.VLLM_ROCM_SPARSE_MLA_DENSE_PREFIX
+            and self._prefill_backend is not None
+            and all(
+                getattr(attention_context[name].impl, "use_aiter_sparse_mla", False)
+                for name in layer_names
+            )
+            else None
+        )
 
     def _sparse_decode_max_split(self, max_seq_len: int) -> int:
         """Cap `max_split_per_batch` for the aiter sparse-MLA decode reduce.
@@ -799,6 +822,55 @@ class ROCMAiterMLASparseMetadataBuilder(
             max(1, effective_len // min_work_per_split)
         )
         return min(ideal_splits, self._num_compute_units)
+
+    def _build_dense_prefix(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        metadata: ROCMAiterMLASparseMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, ROCMAiterMLASparseMetadata] | None:
+        """Dense MHA for the first min(query_len, topk) tokens of each prefill
+        with no context: a token at position p < topk has all p + 1 earlier
+        tokens in its top-k, so causal MHA over its own request attends to the
+        same keys as the sparse kernel, without the per-query gather. The MHA
+        reads the latent back from the cache at their slots, since KV-sharing
+        layers have none of their own."""
+        prefill = metadata.prefill
+        if (
+            self._dense_prefix_backend is None
+            or prefill is None
+            or prefill.route is not SparseMLAPrefillRoute.SPARSE_MQA
+            or metadata.shardq is not None
+        ):
+            return None
+        nd, npf = metadata.num_decodes, metadata.num_prefills
+        qsl = common_attn_metadata.query_start_loc_cpu[nd : nd + npf + 1].numpy()
+        seq_lens = common_attn_metadata.seq_lens_cpu_upper_bound
+        assert seq_lens is not None
+        q_lens = np.diff(qsl)
+        no_context = seq_lens[nd : nd + npf].numpy() == q_lens
+        lens = np.where(no_context, np.minimum(q_lens, self.topk_tokens), 0)
+        keep = lens > 0
+        starts, lens = qsl[:-1][keep], lens[keep].astype(np.int32)
+        if lens.sum() < _DENSE_PREFIX_MIN_TOKENS:
+            return None
+        cu = np.concatenate(([0], np.cumsum(lens))).astype(np.int32)
+        token_ids = np.arange(cu[-1]) + np.repeat(starts - cu[:-1], lens)
+        dense_prefill = SparseMLAPrefillMetadata(
+            block_table=prefill.block_table,
+            query_start_loc=np_to_pinned_tensor(cu).to(self.device, non_blocking=True),
+            max_query_len=int(lens.max()),
+            query_lens_cpu=torch.from_numpy(lens),
+            q_data_type=prefill.q_data_type,
+            output_dtype=prefill.output_dtype,
+            prefill_backend=self._dense_prefix_backend,
+            route=SparseMLAPrefillRoute.DENSE_MHA,
+        )
+        self._dense_prefix_backend.prepare_metadata(dense_prefill)
+        ids = np_to_pinned_tensor(token_ids).to(self.device, non_blocking=True)
+        slots = common_attn_metadata.slot_mapping.index_select(0, ids)
+        block_size = self.kv_cache_spec.block_size
+        kv_index = (slots // block_size, slots % block_size)
+        return ids, kv_index, replace(metadata, prefill=dense_prefill)
 
     def build(
         self,
@@ -854,6 +926,11 @@ class ROCMAiterMLASparseMetadataBuilder(
                 num_tokens,
                 common_attn_metadata.max_query_len,
             )
+            metadata.dense_prefix = self._build_dense_prefix(
+                common_attn_metadata, metadata
+            )
+            if metadata.dense_prefix is not None:
+                sparse_seqlen.index_fill_(0, metadata.dense_prefix[0], 0)
 
             torch.cumsum(
                 sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1]

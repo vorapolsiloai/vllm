@@ -1259,6 +1259,28 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if self.W_UV_dcp is None:
                 self._v_up_proj(attn_out, out=mqa_output_slice)
 
+        dense_prefix = getattr(attn_metadata, "dense_prefix", None)
+        if dense_prefix is not None:
+            # ROCm sparse MLA (VLLM_ROCM_SPARSE_MLA_DENSE_PREFIX): these prefill
+            # tokens had no keys in forward_mqa. Attend their causal prefix
+            # dense, over the cached latent (a KV-sharing layer has no other).
+            ids, kv_index, dense_metadata = dense_prefix
+            kv = kv_cache[kv_index]  # [tokens, kv_lora_rank + qk_rope_head_dim]
+            if fp8_attention:
+                kv = kv.to(q.dtype).mul_(self._k_scale)
+            kv_c, kv_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
+            dense_out = output.new_empty((ids.numel(), output.shape[-1]))
+            self.impl.forward_mha(  # type: ignore[attr-defined]
+                q.index_select(0, ids),
+                kv_c.contiguous(),
+                kv_pe.unsqueeze(1),
+                kv_cache,
+                dense_metadata,
+                self._k_scale,
+                output=dense_out,
+            )
+            output.index_copy_(0, ids, dense_out)
+
         if quant_key is not None:
             quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks
             if quant_idx == 0:

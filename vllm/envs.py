@@ -159,6 +159,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA: bool = False
     VLLM_ROCM_USE_AITER_FLYDSL_SPARSE_MLA: bool = False
     VLLM_ROCM_AITER_FLYDSL_SPARSE_MLA_MIN_TOKENS: int = 160
+    VLLM_ROCM_SPARSE_MLA_DENSE_PREFIX: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = False
     VLLM_ROCM_USE_AITER_FP4BMM: bool = False
@@ -1460,6 +1461,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA", "False").lower()
         in ("true", "1")
+    ),
+    # ROCM_AITER_MLA_SPARSE on the Triton sparse MLA: prefill tokens whose
+    # top-k is their whole causal prefix (no context, position < top-k) run
+    # dense causal MHA instead of the sparse gather; the rest stay sparse.
+    # Disabled by default.
+    "VLLM_ROCM_SPARSE_MLA_DENSE_PREFIX": lambda: (
+        os.getenv("VLLM_ROCM_SPARSE_MLA_DENSE_PREFIX", "False").lower() in ("true", "1")
     ),
     # Run the sparse MLA calls the FlyDSL kernel accepts (bf16 q, fp8_ds_mla
     # cache, no sinks: Kimi-K3.1 DSA) on it instead of Triton; others stay on

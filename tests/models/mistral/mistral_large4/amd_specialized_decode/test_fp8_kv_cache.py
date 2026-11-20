@@ -289,12 +289,13 @@ def long_caches():
     return base, index_cache.contiguous(), cos, sin
 
 
-def long_decode(rows):
+def long_decode(rows, rank=0, npes=1, group=None, indexer_cp=False):
     """Rope-layer kernel of `rows` plain decode rows over the long caches."""
     v, W = build_layer("rope")
     return v.op.Ml4MonoKernel(
-        W, rows, rank=0, npes=1, group=None, topk=TOPK, launches_per_step=1,
-        with_indexer=True, index_max_seq=LONG_PAGES * PAGE, index_request_width=1,
+        W, rows, rank=rank, npes=npes, group=group, topk=TOPK, launches_per_step=1,
+        with_indexer=True, index_max_seq=LONG_PAGES * PAGE, indexer_cp=indexer_cp,
+        index_request_width=1,
         index_page_size=PAGE, index_block_table_stride=LONG_PAGES,
         index_cache_dtype="fp8", attention_weight="fp8_block128",
         kv_cache_layout="atom", kv_cache_dtype="fp8",
@@ -302,11 +303,11 @@ def long_decode(rows):
     )  # fmt: skip
 
 
-def index_step(kernel, h, ctx, tables):
-    """One step of len(ctx) requests, a row each: every row's index scores,
-    their mailbox tags and the keys its selector picked."""
+def index_step(kernel, h, ctx, tables, seq=LONG_PAGES * PAGE):
+    """One step of len(ctx) requests, a row each: every row's index scores
+    (`seq` a row), their mailbox tags and the keys its selector picked."""
     base, index_cache, cos, sin = long_caches()
-    rows, seq = len(ctx), LONG_PAGES * PAGE
+    rows = len(ctx)
     positions = ctx - 1
     slots = tables[torch.arange(rows), positions // PAGE].long() * PAGE
     slots += positions % PAGE
@@ -359,6 +360,71 @@ def test_index_select_long_contexts():
             kth = own.topk(TOPK).values[-1]
             assert (own[picked[s]] >= kth).all(), s
             assert torch.isin((own > kth).nonzero().flatten(), picked[s]).all(), s
+
+
+CP = 4  # TP4: the context-parallel indexer's ranks
+
+
+def _cp_rank(rank, port, ctx, tables, h, out):
+    """One rank of a TP4 step with the context-parallel indexer over the long
+    caches: its score plane (its shard of each long row) and picked keys."""
+    import torch.distributed as dist
+
+    torch.accelerator.set_device_index(rank)
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=CP
+    )
+    try:
+        cp = dict(rank=rank, npes=CP, group=dist.group.WORLD, indexer_cp=True)
+        with torch.inference_mode(), long_decode(len(ctx), **cp) as kernel:
+            scores, _, picked = index_step(
+                kernel, h.cuda(), ctx.cuda(), tables.cuda(), LONG_PAGES * PAGE // CP
+            )
+        torch.save([scores.cpu(), picked.cpu()], f"{out}/rank{rank}.pt")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.distributed(num_gpus=CP)
+@pytest.mark.skipif(torch.accelerator.device_count() < CP, reason="needs 4 GPUs")
+@pytest.mark.parametrize("ctx", [(40000, 16385, 3000, 20000), (40000,), (9000,)])
+@torch.inference_mode()
+def test_index_select_context_parallel(ctx, tmp_path):
+    """TP4 with the context-parallel indexer: each rank scores a contiguous
+    quarter of every row's keys and the peers select together. Every rank picks
+    the same keys as one GPU, the row's top TOPK by the one-GPU scores, and a
+    long row's local shard holds those same scores."""
+    import torch.multiprocessing as mp
+
+    from vllm.utils.network_utils import get_open_port
+
+    ctx = torch.tensor(ctx)
+    rows, need = len(ctx), (ctx + PAGE - 1) // PAGE
+    torch.manual_seed(3)
+    pages = torch.randperm(LONG_PAGES, dtype=torch.int32)
+    tables = torch.zeros(rows, LONG_PAGES, dtype=torch.int32)
+    for s in range(rows):
+        start = int(need[:s].sum())
+        tables[s, : need[s]] = pages[start : start + int(need[s])]
+    h = torch.randn(rows, HIDDEN).to(torch.bfloat16)
+    with long_decode(rows) as kernel:
+        scores, _, ref = index_step(kernel, h.cuda(), ctx.cuda(), tables.cuda())
+    scores, ref = scores.cpu(), ref.cpu().long()
+    mp.spawn(_cp_rank, args=(get_open_port(), ctx, tables, h, tmp_path), nprocs=CP)
+    for r in range(CP):
+        shard, picked = torch.load(tmp_path / f"rank{r}.pt")
+        for s in range(rows):
+            n, got = int(ctx[s]), picked[s].long()
+            own = scores[s, :n]
+            kth = own.topk(TOPK).values[-1]
+            assert got.unique().numel() == TOPK and int(got.max()) < n, (r, s)
+            assert (own[got] >= kth).all(), (r, s)
+            assert torch.isin((own > kth).nonzero().flatten(), got).all(), (r, s)
+            assert torch.equal(got.sort().values, ref[s].sort().values), (r, s)
+            if n > 16384:  # past one selector leaf, a rank keeps its scores
+                stride = -(-n // (CP * 64)) * 64  # whole 64-key scoring tiles
+                part = own[r * stride : (r + 1) * stride]
+                assert torch.equal(shard[s, : part.numel()], part), (r, s)
 
 
 @pytest.mark.parametrize("kind", ("rope", "nope"))

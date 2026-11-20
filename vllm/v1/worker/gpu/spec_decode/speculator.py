@@ -166,6 +166,10 @@ class DraftModelSpeculator(BaseSpeculator):
     # Draft prefill runs on the target's batch, so it can reuse the target
     # forward's attention metadata. Otherwise the drafter rebuilds it.
     can_reuse_target_attn_metadata: bool = True
+    # Whether the drafter embeds the prompt tokens, so a multimodal target must
+    # pass its multimodal embeddings for the placeholder positions. Drafters
+    # whose context is the target's hidden states see the media through them.
+    embeds_prompt_tokens: bool = True
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         assert vllm_config.speculative_config is not None
@@ -318,10 +322,13 @@ class DraftModelSpeculator(BaseSpeculator):
         for layer_name in self.draft_attn_layer_names:
             all_attn_layers[layer_name].is_draft_layer = True
 
-        target_supports_mm = self.vllm_config.model_config.supports_multimodal_inputs
+        needs_mm_embeds = (
+            self.embeds_prompt_tokens
+            and self.vllm_config.model_config.supports_multimodal_inputs
+        )
         draft_supports_mm = supports_multimodal_embeddings(self.model)
-        self.supports_mm_inputs = target_supports_mm and draft_supports_mm
-        if target_supports_mm and not draft_supports_mm:
+        self.supports_mm_inputs = needs_mm_embeds and draft_supports_mm
+        if needs_mm_embeds and not draft_supports_mm:
             logger.warning_once(
                 "Draft model %s does not support external multimodal embeddings. "
                 "Embeddings from the target model will not be passed to the "

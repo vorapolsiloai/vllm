@@ -38,6 +38,9 @@ logger = init_logger(__name__)
 
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
+    # The draft context is the target's hidden states (which already encode any
+    # multimodal input), and the query block holds only sampled and mask tokens.
+    embeds_prompt_tokens = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         parallel_config = vllm_config.parallel_config
@@ -60,7 +63,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
 
-        # Multimodal inputs not currently supported.
+        # No multimodal embeddings needed (see embeds_prompt_tokens).
         self.supports_mm_inputs = False
 
         # Each request emits exactly (bonus + N mask) query tokens per step.

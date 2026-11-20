@@ -26,6 +26,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.spec_decode import speculator as base_spec_module
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
     prepare_input_buffers,
@@ -310,6 +311,37 @@ def test_load_model_disables_mm_support_for_text_only_drafter(monkeypatch):
             "drafter; using text-only draft inputs instead."
         )
     ]
+
+
+@pytest.mark.parametrize(
+    "draft_model_cls", [_TextOnlyDraftModel, _MultimodalDraftModel]
+)
+def test_dflash_drafter_takes_no_mm_inputs(monkeypatch, draft_model_cls):
+    # The DFlash-family context is the target's hidden states, which already
+    # encode the media: no multimodal embeddings and no text-only warning.
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.supports_mm_inputs = False
+    speculator.use_acceptance_estimator = False
+    speculator.use_draft_logits = False
+    speculator.dcp_size = 1
+    speculator.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(supports_multimodal_inputs=True)
+    )
+    warning_messages = []
+    _mock_base_model_load(monkeypatch)
+    monkeypatch.setattr(
+        DFlashSpeculator, "load_draft_model", lambda self, *args: draft_model_cls()
+    )
+    monkeypatch.setattr(
+        base_spec_module.logger,
+        "warning_once",
+        lambda message, *args: warning_messages.append(message % args),
+    )
+
+    speculator.load_model(torch.nn.Module())
+
+    assert not speculator.supports_mm_inputs
+    assert warning_messages == []
 
 
 def test_multi_module_mm_support_configured_after_model_load(monkeypatch):

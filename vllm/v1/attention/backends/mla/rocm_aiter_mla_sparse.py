@@ -623,9 +623,9 @@ def _index_epoch(buf: object, owns_indexer: bool) -> int:
 
 # Below this many dense-eligible tokens per step the dense pass (cache gather,
 # kv_b up-projection, flash attention, output gather) costs more than it saves:
-# the sparse kernel's saving grows with the tokens, the dense pass has a fixed
-# cost of about 2048 tokens' saving at 16 heads on MI355X.
-_DENSE_PREFIX_MIN_TOKENS = 2560
+# the saving grows with the tokens, the dense pass has a fixed cost (break-even
+# near 1700 tokens at 16 heads on MI355X).
+_DENSE_PREFIX_MIN_TOKENS = 2048
 
 
 @dataclass
@@ -869,6 +869,7 @@ class ROCMAiterMLASparseMetadataBuilder(
         starts, lens = qsl[:-1][lens > 0], lens[lens > 0].astype(np.int32)
         if lens.sum() < _DENSE_PREFIX_MIN_TOKENS:
             return None
+        logger.info_once("Sparse MLA: dense causal MHA for prefill prefixes in use")
         cu = np.concatenate(([0], np.cumsum(lens))).astype(np.int32)
         token_ids = np.arange(cu[-1]) + np.repeat(starts - cu[:-1], lens)
         dense_prefill = SparseMLAPrefillMetadata(

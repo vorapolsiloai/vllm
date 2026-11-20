@@ -65,14 +65,13 @@ Every TP rank agrees on each verdict before anything collective runs.
 ## Steps
 
 `plan()` runs once per forward. It picks the kernels for a pure decode step
-whose row count is one of the built widths, 1, 2 or 4 (`DecodeConfig.widths`:
+whose row count is one of the built widths, 1, 2, 4 or 8 (`DecodeConfig.widths`:
 vLLM's FULL-graph capture sizes, so graph replays pad decode batches to them;
 padded rows attend to no keys and write nothing). Every other step runs vLLM's
-layers: prefill, mixed, wider (5+ requests), eager steps of other sizes and
+layers: prefill, mixed, wider (9+ requests), eager steps of other sizes and
 microbatched steps. The decisions read host metadata every rank holds alike.
-One kernel is built per width and layer kind (12 launchers) at the first
-planned step. An 8-row launch exists and is correct, but measured slower than
-vLLM's layers at 8 requests, so it is not served.
+One kernel is built per width and layer kind (16 launchers) at the first
+planned step.
 
 With DSpark (`--speculative-config '{"method": "dspark", ...}'`), a target
 verify step is `q = num_speculative_tokens + 1` consecutive rows per request

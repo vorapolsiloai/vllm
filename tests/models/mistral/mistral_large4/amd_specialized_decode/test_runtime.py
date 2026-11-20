@@ -130,7 +130,7 @@ def test_default_deny(field, value):
 def test_widths_are_graph_capture_sizes():
     # vLLM pads decode batches to its capture sizes 1, 2, 4, 8, ...; every width
     # the kernels serve must be one, or FULL-graph replays would never use them
-    assert DECODE_CONFIG.widths == (1, 2, 4)
+    assert DECODE_CONFIG.widths == (1, 2, 4, 8)
 
 
 def test_supported_has_no_reasons():

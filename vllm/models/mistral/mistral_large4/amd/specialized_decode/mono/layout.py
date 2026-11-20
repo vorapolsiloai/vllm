@@ -546,7 +546,7 @@ def stage_tasks(
     tasks = [
         ("qkv_a", N_QKV_A),
         ("q_norm", samples),
-        ("cache", 1),
+        ("cache", samples),
         ("q_b", heads * (NOPE_DIM + Q_PE_DIM) // Q_B_TILE),
     ]
     if with_indexer:

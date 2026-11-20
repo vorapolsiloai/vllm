@@ -5249,6 +5249,11 @@ def build_ml4_monokernel(
                 else 1
             )
             dn_experts: dict[int, tuple] = {}
+            # A run that is exactly one (sample, slot)'s k-chunks starts on a
+            # run boundary, so a unit's chunk is ``cc % (DN_NKC // 2)`` at build
+            # time. Traced, the per-unit div/mod stays live across the unrolled
+            # stream and spills at S=8. Bit-identical: the same chunk index.
+            DN_RUN = DN_HOIST == DN_NKC // 2
 
             def dn_expert(cc):
                 """`(s_q, slot_q, wb, sb)` for the (sample, slot) owning `cc`."""
@@ -5286,7 +5291,7 @@ def build_ml4_monokernel(
                 qu = (wave % DN_WPR) * DN_UPW + cc
                 unit = fx.min(qu, DN_NU - 1)
                 q = unit * 2  # 64-k chunk index over (s, slot, kc) of the stream
-                kc = q % DN_NKC
+                kc = (cc % (DN_NKC // 2)) * 2 if const_expr(DN_RUN) else q % DN_NKC
                 s_q, slot_q, wb, sb = dn_expert(cc)
                 # The mid activation and ``misc`` are addressed in the full
                 # (s, MOE_SLOTS, kc) space, which the stream only coincides
@@ -5313,7 +5318,7 @@ def build_ml4_monokernel(
                             wb,
                             sb,
                             dn_rg + gu,
-                            unit % (expert_inter // 128),
+                            kc // 2,
                             expert_inter,
                             unit * 32,
                             unit * 4 + lane // 16,
@@ -5324,7 +5329,7 @@ def build_ml4_monokernel(
                         wb,
                         sb,
                         dn_rg + gu,
-                        unit % (expert_inter // 128),
+                        kc // 2,
                         expert_inter,
                         unit * 64,
                         bf16_coef,
@@ -5428,14 +5433,25 @@ def build_ml4_monokernel(
                 ),
                 mark=("down", t),
             )
-            mids = get2_many(
-                [
-                    (mb("mid"), fx.min(wave + b * WAVES, DN_BLK - 1) * 128 + lane * 2)
-                    for b in range((DN_BLK + WAVES - 1) // WAVES)
-                ]
-            )
-            stamp("down", t, 2)
-            for b in range_constexpr((DN_BLK + WAVES - 1) // WAVES):
+            # Past two poll batches, quantize each batch as it lands: polling
+            # all of a wave's mid blocks first keeps them all live (60 pairs a
+            # lane at S=8). ``poll`` waits batch by batch either way.
+            DN_MB = (DN_BLK + WAVES - 1) // WAVES
+            DN_QB = DN_MB if DN_MB <= 2 * POLL_MAX else POLL_MAX
+            mids = [None] * DN_MB
+            for b in range_constexpr(DN_MB):
+                if const_expr(b % DN_QB == 0):
+                    mids[b : b + DN_QB] = get2_many(
+                        [
+                            (
+                                mb("mid"),
+                                fx.min(wave + i * WAVES, DN_BLK - 1) * 128 + lane * 2,
+                            )
+                            for i in range(b, min(b + DN_QB, DN_MB))
+                        ]
+                    )
+                    if const_expr(b + DN_QB >= DN_MB):
+                        stamp("down", t, 2)
                 blk = wave + b * WAVES
                 if blk < DN_BLK:
                     if const_expr(expert_mxfp4):

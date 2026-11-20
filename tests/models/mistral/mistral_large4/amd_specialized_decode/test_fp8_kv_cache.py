@@ -224,6 +224,54 @@ def test_fp8_cache_matches_bf16(kind, history_scale):
         assert rel < 0.1, rel
 
 
+@torch.inference_mode()
+def test_index_scores_cover_each_context():
+    """Plain decode of S requests of different lengths, one row each: the fused
+    indexer scores every key of each row's own context in the launch and no key
+    past it, whatever the other rows' lengths."""
+    v, W = build_layer("rope")
+    base, index_cache, step = make_step()
+    ctx = torch.tensor([700, 64, 2049, 1], device="cuda")  # keys, incl. the new row
+    need = (ctx + PAGE - 1) // PAGE
+    pages = torch.randperm(PAGES, device="cuda", dtype=torch.int32)
+    tables = torch.zeros(S, PAGES, dtype=torch.int32, device="cuda")
+    for s in range(S):
+        start = int(need[:s].sum())
+        tables[s, : need[s]] = pages[start : start + int(need[s])]
+    positions = ctx - 1
+    slots = tables[torch.arange(S), positions // PAGE].long() * PAGE + positions % PAGE
+    nkeys = torch.clamp(ctx, max=TOPK)
+    indptr = torch.cat([nkeys.new_zeros(1), nkeys.cumsum(0)]).int()
+    kernel = v.op.Ml4MonoKernel(
+        W, S, rank=0, npes=1, group=None, topk=TOPK, launches_per_step=1,
+        with_indexer=True, index_max_seq=PAGES * PAGE, index_request_width=1,
+        index_page_size=PAGE, index_block_table_stride=PAGES,
+        index_cache_dtype="fp8", attention_weight="fp8_block128",
+        kv_cache_layout="atom", kv_cache_dtype="fp8",
+        native_fp4_mfma=True, rope_dtype="fp32", separate_shared=True,
+    )  # fmt: skip
+    try:
+        kv = base.clone()
+        out = kernel.forward(
+            step["h"], step["cur_pos"], kv, kv, None, step["cos"], step["sin"],
+            index_cache=index_cache.clone(), block_tables=tables,
+            positions=positions, slot_mapping=slots, sparse_kv_indptr=indptr,
+        )  # fmt: skip
+        torch.accelerator.synchronize()
+        assert torch.isfinite(out).all()
+        # (score, tag) pairs; a fresh scratch holds tag 0 until a launch writes
+        off = kernel.scr_layout["index_scores"]
+        n = S * PAGES * PAGE
+        tags = kernel.scratch[off : off + n * 8].view(torch.int32)[1::2].view(S, -1)
+        live = tags[0, 0].item()
+        assert live != 0
+        for s in range(S):
+            assert (tags[s, : ctx[s]] == live).all(), s
+            assert (tags[s, ctx[s] :] == 0).all(), s
+    finally:
+        kernel.close()
+
+
 @pytest.mark.parametrize("kind", ("rope", "nope"))
 @torch.inference_mode()
 def test_fp8_cache_saturates(kind):

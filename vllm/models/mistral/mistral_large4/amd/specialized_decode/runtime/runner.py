@@ -200,9 +200,11 @@ class MonoRunner:
                 nope, kvs, with_indexer = KINDS[kind]
                 v = _variant(kind)
                 inter = v.geometry_config.ml4_tp_config(npes).inter
+                # context-parallel indexer: each rank scores a quarter of every
+                # row's keys and the peers select the exact global top-k
                 scr, sym_l = v.layout.layout(
                     rows, heads, npes, cfg.topk, with_indexer, index_max_seq,
-                    inter=inter, native_fp4_mfma=True,
+                    inter=inter, native_fp4_mfma=True, indexer_cp=with_indexer,
                 )  # fmt: skip
                 builds.append((rows, kind, v, inter, with_indexer))
                 key = (nope, kvs)
@@ -223,6 +225,7 @@ class MonoRunner:
                 inter=inter,
                 output_heads=heads,
                 with_indexer=with_indexer,
+                indexer_cp=with_indexer,
                 shared_indices=kind == LayerKind.ROPE_SHARED,
                 fault_offset=fault_offset,
             )  # fmt: skip

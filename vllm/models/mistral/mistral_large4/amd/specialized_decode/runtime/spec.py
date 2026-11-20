@@ -24,10 +24,8 @@ class DecodeConfig:
     blocks: int = 256  # one CTA per CU, all co-resident
     # rows a launch serves (one decode token per request): vLLM's FULL-graph
     # capture sizes, so graph replays pad decode batches to them; eager steps
-    # of other sizes and batches above 4 rows run stock. The 8-row launch
-    # builds and is correct but measured slower than vLLM's layers (super-linear
-    # up/gate and down stages), so it is not served.
-    widths: tuple[int, ...] = (1, 2, 4)
+    # of other sizes and batches above 8 rows run stock
+    widths: tuple[int, ...] = (1, 2, 4, 8)
     topk: int = 2048
     # rows a request takes in a step: 1, or num_speculative_tokens + 1 for a
     # speculative verify block (the kernels' ``index_request_width``)
@@ -132,7 +130,6 @@ def specialized_decode_config(config: VllmConfig) -> DecodeConfig | None:
     if spec is None:
         return DECODE_CONFIG
     # one request's verify block (q rows) per launch: two requests (8 rows at
-    # q=4) build and are correct but measured slower than vLLM's layers, as the
-    # 8-row launch without speculation (see ``widths``)
+    # q=4) build and are correct but measured slower than vLLM's layers
     q = spec.num_speculative_tokens + 1
     return replace(DECODE_CONFIG, q=q, widths=(q,))

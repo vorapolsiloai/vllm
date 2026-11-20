@@ -1173,7 +1173,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 output_scale=mha_output_scale,
             )
 
-        if num_mqa_tokens > 0:
+        dense_prefix = getattr(attn_metadata, "dense_prefix", None)
+        if dense_prefix is not None:
+            self._forward_dense_prefix(q, kv_cache, dense_prefix, fp8_attention, output)
+        elif num_mqa_tokens > 0:
             mqa_output_slice = output[:num_mqa_tokens]
             if mqa_q_prepared is not None:
                 mqa_q = mqa_q_prepared[:num_mqa_tokens]
@@ -1258,28 +1261,6 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # v_up projection, unless the DCP merge already applied it
             if self.W_UV_dcp is None:
                 self._v_up_proj(attn_out, out=mqa_output_slice)
-
-        dense_prefix = getattr(attn_metadata, "dense_prefix", None)
-        if dense_prefix is not None:
-            # ROCm sparse MLA (VLLM_ROCM_SPARSE_MLA_DENSE_PREFIX): these prefill
-            # tokens had no keys in forward_mqa. Attend their causal prefix
-            # dense, over the cached latent (a KV-sharing layer has no other).
-            ids, kv_index, dense_metadata = dense_prefix
-            kv = kv_cache[kv_index]  # [tokens, kv_lora_rank + qk_rope_head_dim]
-            if fp8_attention:
-                kv = kv.to(q.dtype).mul_(self._k_scale)
-            kv_c, kv_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
-            dense_out = output.new_empty((ids.numel(), output.shape[-1]))
-            self.impl.forward_mha(  # type: ignore[attr-defined]
-                q.index_select(0, ids),
-                kv_c.contiguous(),
-                kv_pe.unsqueeze(1),
-                kv_cache,
-                dense_metadata,
-                self._k_scale,
-                output=dense_out,
-            )
-            output.index_copy_(0, ids, dense_out)
 
         if quant_key is not None:
             quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks
@@ -1491,6 +1472,45 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     assert self.dcp_manager.query_gather is not None
                     mqa_q = self.dcp_manager.query_gather(mqa_q)
         return mqa_q
+
+    def _forward_dense_prefix(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        dense_prefix: Any,
+        fp8_attention: bool,
+        output: torch.Tensor,
+    ) -> None:
+        """ROCm sparse MLA, VLLM_ROCM_SPARSE_MLA_DENSE_PREFIX: sparse MQA on the
+        kept tokens only, dense causal MHA for the others over their latent read
+        back from the cache (a KV-sharing layer has no latent of its own)."""
+        keep, ids = dense_prefix.keep, dense_prefix.ids
+        if keep.numel():
+            mqa_metadata = dense_prefix.mqa_metadata
+            mqa_q = self._prepare_mqa_query(
+                q.index_select(0, keep),
+                qrep_decode=False,
+                fused_q_heads=self._fused_decode_query_heads(mqa_metadata),
+            )
+            attn_out, _ = self.impl.forward_mqa(mqa_q, kv_cache, mqa_metadata, self)  # type: ignore[attr-defined]
+            mqa_out = output.new_empty((keep.numel(), output.shape[-1]))
+            self._v_up_proj(attn_out, out=mqa_out)
+            output.index_copy_(0, keep, mqa_out)
+        kv = kv_cache[dense_prefix.kv_index]  # [tokens, kv_lora_rank + rope dim]
+        if fp8_attention:
+            kv = kv.to(q.dtype).mul_(self._k_scale)
+        kv_c, kv_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
+        dense_out = output.new_empty((ids.numel(), output.shape[-1]))
+        self.impl.forward_mha(  # type: ignore[attr-defined]
+            q.index_select(0, ids),
+            kv_c.contiguous(),
+            kv_pe.unsqueeze(1),
+            kv_cache,
+            dense_prefix.mha_metadata,
+            self._k_scale,
+            output=dense_out,
+        )
+        output.index_copy_(0, ids, dense_out)
 
     def _use_sparse_mha(self, attn_metadata: "MLACommonMetadata") -> bool:
         prefill = attn_metadata.prefill

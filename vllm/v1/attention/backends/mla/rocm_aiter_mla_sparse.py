@@ -622,9 +622,21 @@ def _index_epoch(buf: object, owns_indexer: bool) -> int:
 
 
 # Below this many dense-eligible tokens per step the dense pass (cache gather,
-# kv_b up-projection, flash attention, scatter) costs more than the sparse
-# rows it empties: those tokens still run the MQA path, with zero keys.
-_DENSE_PREFIX_MIN_TOKENS = 6144
+# kv_b up-projection, flash attention, scatter) costs more than it saves.
+_DENSE_PREFIX_MIN_TOKENS = 2048
+
+
+@dataclass
+class DensePrefix:
+    """VLLM_ROCM_SPARSE_MLA_DENSE_PREFIX: the `ids` tokens run dense causal MHA
+    over their latent, read back from the cache at `kv_index` (block, offset);
+    the `keep` tokens run sparse MQA on their own."""
+
+    ids: torch.Tensor
+    kv_index: tuple[torch.Tensor, torch.Tensor]
+    mha_metadata: "ROCMAiterMLASparseMetadata"  # prefill = their DENSE_MHA prefill
+    keep: torch.Tensor
+    mqa_metadata: "ROCMAiterMLASparseMetadata"  # the kept tokens' sparse stream
 
 
 @dataclass(kw_only=True)
@@ -651,10 +663,10 @@ class ROCMAiterMLASparseMetadata(SparseMLACommonMetadata):
     reduce_final_map: torch.Tensor | None = None
     reduce_partial_map: torch.Tensor | None = None
 
-    # VLLM_ROCM_SPARSE_MLA_DENSE_PREFIX: (token ids, their (block, offset) in
-    # the cache, this metadata with their dense MHA prefill). They get no keys
-    # in the sparse stream.
-    dense_prefix: tuple | None = None
+    dense_prefix: DensePrefix | None = None
+    # Rows of the top-k buffer this metadata's tokens read (None: the first
+    # num_actual_tokens): the kept tokens of a DensePrefix.
+    token_rows: torch.Tensor | None = None
 
 
 @dataclass
@@ -827,7 +839,8 @@ class ROCMAiterMLASparseMetadataBuilder(
         self,
         common_attn_metadata: CommonAttentionMetadata,
         metadata: ROCMAiterMLASparseMetadata,
-    ) -> tuple[torch.Tensor, torch.Tensor, ROCMAiterMLASparseMetadata] | None:
+        sparse_seqlen: torch.Tensor,
+    ) -> DensePrefix | None:
         """Dense MHA for the first min(query_len, topk) tokens of each prefill
         with no context: a token at position p < topk has all p + 1 earlier
         tokens in its top-k, so causal MHA over its own request attends to the
@@ -849,8 +862,7 @@ class ROCMAiterMLASparseMetadataBuilder(
         q_lens = np.diff(qsl)
         no_context = seq_lens[nd : nd + npf].numpy() == q_lens
         lens = np.where(no_context, np.minimum(q_lens, self.topk_tokens), 0)
-        keep = lens > 0
-        starts, lens = qsl[:-1][keep], lens[keep].astype(np.int32)
+        starts, lens = qsl[:-1][lens > 0], lens[lens > 0].astype(np.int32)
         if lens.sum() < _DENSE_PREFIX_MIN_TOKENS:
             return None
         cu = np.concatenate(([0], np.cumsum(lens))).astype(np.int32)
@@ -866,11 +878,28 @@ class ROCMAiterMLASparseMetadataBuilder(
             route=SparseMLAPrefillRoute.DENSE_MHA,
         )
         self._dense_prefix_backend.prepare_metadata(dense_prefill)
-        ids = np_to_pinned_tensor(token_ids).to(self.device, non_blocking=True)
+        keep = np.ones(metadata.num_actual_tokens, dtype=bool)
+        keep[token_ids] = False
+        ids, keep = (
+            np_to_pinned_tensor(x).to(self.device, non_blocking=True)
+            for x in (token_ids, np.flatnonzero(keep))
+        )
         slots = common_attn_metadata.slot_mapping.index_select(0, ids)
-        block_size = self.kv_cache_spec.block_size
-        kv_index = (slots // block_size, slots % block_size)
-        return ids, kv_index, replace(metadata, prefill=dense_prefill)
+        indptr = metadata.paged_kv_indptr.new_zeros(keep.numel() + 1)
+        torch.cumsum(sparse_seqlen.index_select(0, keep), dim=0, out=indptr[1:])
+        return DensePrefix(
+            ids=ids,
+            kv_index=(slots // metadata.block_size, slots % metadata.block_size),
+            mha_metadata=replace(metadata, prefill=dense_prefill),
+            keep=keep,
+            mqa_metadata=replace(
+                metadata,
+                num_actual_tokens=keep.numel(),
+                req_id_per_token=metadata.req_id_per_token.index_select(0, keep),
+                paged_kv_indptr=indptr,
+                token_rows=keep,
+            ),
+        )
 
     def build(
         self,
@@ -926,11 +955,6 @@ class ROCMAiterMLASparseMetadataBuilder(
                 num_tokens,
                 common_attn_metadata.max_query_len,
             )
-            metadata.dense_prefix = self._build_dense_prefix(
-                common_attn_metadata, metadata
-            )
-            if metadata.dense_prefix is not None:
-                sparse_seqlen.index_fill_(0, metadata.dense_prefix[0], 0)
 
             torch.cumsum(
                 sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1]
@@ -1048,6 +1072,10 @@ class ROCMAiterMLASparseMetadataBuilder(
         metadata.reduce_indptr = reduce_indptr
         metadata.reduce_final_map = reduce_final_map
         metadata.reduce_partial_map = reduce_partial_map
+        if not dcp:
+            metadata.dense_prefix = self._build_dense_prefix(
+                common_attn_metadata, metadata, sparse_seqlen
+            )
         return metadata
 
 
@@ -1639,8 +1667,12 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
         ):
             # Get topk indices
             assert self.topk_indices_buffer is not None
+            rows = attn_metadata.token_rows
             topk_indices = fit_kpool_indices_to_aiter(
-                self.topk_indices_buffer[:num_actual_toks], attn_metadata.topk_tokens
+                self.topk_indices_buffer[:num_actual_toks]
+                if rows is None
+                else self.topk_indices_buffer.index_select(0, rows),
+                attn_metadata.topk_tokens,
             )
 
             triton_convert_req_index_to_global_index(

@@ -2904,6 +2904,15 @@ def build_ml4_monokernel(
                     return begin, fx.max(fx.Int32(0), fx.min(stride, bound - begin))
                 return fx.Int32(0), bound
 
+            def new_index_key(sn, k):
+                """Elements k..k+7 of this launch's index key `sn` as bf16."""
+                values = []
+                for pair in get_bf2_many(
+                    [(mb("index_k_new"), sn * INDEX_DIM + k + j * 2) for j in range(4)]
+                ):
+                    values += list(pair)
+                return fx.Vector.from_elements(values, fx.Float32).to(fx.BFloat16)
+
             def load_index_q8(head, k):
                 words = fx.Vector.from_elements(
                     [lds_ld(xs, (head * INDEX_DIM + k) // 2 + j) for j in range(4)],
@@ -2925,7 +2934,11 @@ def build_ml4_monokernel(
                 )
             live_tiles = fx.min(live_tiles, fx.Int32(N_INDEX_SPLIT))
             STAGE_BELOW = G if G % S == 0 else N_INDEX_SPLIT * S
-            for tt in range(start("index_score"), live_tiles * S, G):
+            # Tiles a pass of the loop below (tasks tt, tt + G, ...: one row when S
+            # divides G). One with the context-parallel indexer, whose exchange
+            # reuses the reduction words a second tile would take.
+            SCORE_UNROLL = 1 if indexer_cp or G % S else 4
+            for tt in range(start("index_score"), live_tiles * S, G * SCORE_UNROLL):
                 tt = fx.Int32(tt)
                 s = tt % S
                 tile = tt // S
@@ -2991,106 +3004,135 @@ def build_ml4_monokernel(
                     gpu.barrier()
                     key_group = wave // 2
                     head_group = wave % 2
-                    local_key = tile * INDEX_KEYS_PER_TASK + key_group * 16 + lane % 16
-                    key_pos = shard_begin + local_key
-                    safe_key = fx.min(key_pos, bound - 1)
                     head = head_group * 16 + lane % 16
-                    if const_expr(index_fp8):
-                        index_page, index_row = index_page_cell(s, safe_key)
-                        kv_scale = ld_f32(
-                            r_index_cache,
-                            index_fp8_scale_dword(
-                                index_page, index_row, index_page_size
-                            ),
+                    # Every key load of the pass's tiles is issued before the first
+                    # MFMA, so their memory round trips overlap instead of adding up.
+                    tiles = []
+                    for u in range_constexpr(SCORE_UNROLL):
+                        local_key = (
+                            (tile + u * (G // S)) * INDEX_KEYS_PER_TASK
+                            + key_group * 16
+                            + lane % 16
                         )
-                    score_frag = fx.Vector.filled(4, 0.0, fx.Float32)
-                    for k32 in range_constexpr(INDEX_DIM // 32):
-                        k = k32 * 32 + (lane // 16) * 8
-                        qv = load_index_q8(head, k)
+                        key_pos = shard_begin + local_key
+                        safe_key = fx.min(key_pos, bound - 1)
+                        kv_scale = fx.Float32(1.0)
                         if const_expr(index_fp8):
+                            index_page, index_row = index_page_cell(s, safe_key)
+                            kv_scale = ld_f32(
+                                r_index_cache,
+                                index_fp8_scale_dword(
+                                    index_page, index_row, index_page_size
+                                ),
+                            )
                             # Eight preshuffled E4M3 bytes; the row's eight
                             # columns k..k+7 share one 16-column tile, so they
-                            # are contiguous.  E4M3 -> bf16 is exact, and the
-                            # row scale multiplies the finished score instead of
-                            # every key element.
-                            fp8_words = fx.Vector(
-                                bo.buffer_load(
-                                    r_index_cache,
-                                    index_fp8_data_dword(
-                                        index_page, index_row, k, index_page_size
-                                    ),
-                                    vec_width=2,
-                                    dtype=T.i32,
+                            # are contiguous.
+                            words = [
+                                fx.Vector(
+                                    bo.buffer_load(
+                                        r_index_cache,
+                                        index_fp8_data_dword(
+                                            index_page,
+                                            index_row,
+                                            k32 * 32 + (lane // 16) * 8,
+                                            index_page_size,
+                                        ),
+                                        vec_width=2,
+                                        dtype=T.i32,
+                                    )
                                 )
-                            )
-                            kv = _fp8_to_bf16x8(fp8_words[0], fp8_words[1])
+                                for k32 in range(INDEX_DIM // 32)
+                            ]
                         else:
-                            kv = fx.Vector(
-                                bo.buffer_load(
-                                    r_index_cache,
-                                    (index_page_slot(s, safe_key) * INDEX_DIM + k) // 2,
-                                    vec_width=4,
-                                    dtype=T.i32,
+                            words = [
+                                fx.Vector(
+                                    bo.buffer_load(
+                                        r_index_cache,
+                                        (
+                                            index_page_slot(s, safe_key) * INDEX_DIM
+                                            + k32 * 32
+                                            + (lane // 16) * 8
+                                        )
+                                        // 2,
+                                        vec_width=4,
+                                        dtype=T.i32,
+                                    )
                                 )
-                            ).bitcast(fx.BFloat16)
-                        if safe_key >= first_position:
+                                for k32 in range(INDEX_DIM // 32)
+                            ]
+                        tiles.append((local_key, key_pos, safe_key, kv_scale, words))
+                    for u in range_constexpr(SCORE_UNROLL):
+                        local_key, key_pos, safe_key, kv_scale, words = tiles[u]
+                        if const_expr(index_fp8):
+                            # E4M3 -> bf16 is exact, and the row scale multiplies
+                            # the finished score instead of every key element.
+                            kv0, kv1, kv2, kv3 = [
+                                _fp8_to_bf16x8(w[0], w[1]) for w in words
+                            ]
+                        else:
+                            kv0, kv1, kv2, kv3 = [w.bitcast(fx.BFloat16) for w in words]
+                        if (safe_key >= first_position) & (key_pos < bound):
+                            # This launch's own rows: read the dequantized keys
+                            # from their mailbox, not the cache being written.
+                            # Keys past the bound (padding lanes, tiles past the
+                            # context) are never stored, so they skip the poll.
                             sn = request_start + safe_key - first_position
-                            kv_pairs = get_bf2_many(
-                                [
-                                    (mb("index_k_new"), sn * INDEX_DIM + k + j * 2)
-                                    for j in range(4)
-                                ]
+                            kv0, kv1, kv2, kv3 = [
+                                new_index_key(sn, k32 * 32 + (lane // 16) * 8)
+                                for k32 in range(INDEX_DIM // 32)
+                            ]
+                        kvs = (kv0, kv1, kv2, kv3)
+                        score_frag = fx.Vector.filled(4, 0.0, fx.Float32)
+                        for k32 in range_constexpr(INDEX_DIM // 32):
+                            qv = load_index_q8(head, k32 * 32 + (lane // 16) * 8)
+                            score_frag = fx.Vector(
+                                rocdl.mfma_f32_16x16x32_bf16(
+                                    T.vec(4, T.f32), [qv, kvs[k32], score_frag]
+                                )
                             )
-                            kv_values = []
-                            for pair in kv_pairs:
-                                kv_values += list(pair)
-                            kv = fx.Vector.from_elements(kv_values, fx.Float32).to(
-                                fx.BFloat16
+                        partial = fx.Float32(0.0)
+                        for e in range_constexpr(4):
+                            index_head = head_group * 16 + (lane // 16) * 4 + e
+                            weight = lds_ld(keys, index_head).bitcast(fx.Float32)
+                            partial = (
+                                partial
+                                + fx.max(score_frag[e], fx.Float32(0.0)) * weight
                             )
-                        score_frag = fx.Vector(
-                            rocdl.mfma_f32_16x16x32_bf16(
-                                T.vec(4, T.f32), [qv, kv, score_frag]
+                        if const_expr(index_fp8):
+                            # Rows this launch wrote came from the mailbox already
+                            # dequantized; only cache reads carry a scale.  The key
+                            # is lane % 16, which the two reductions below preserve,
+                            # so one factor per lane is correct either side of them.
+                            partial = partial * (safe_key >= first_position).select(
+                                fx.Float32(1.0), kv_scale
                             )
-                        )
-                    partial = fx.Float32(0.0)
-                    for e in range_constexpr(4):
-                        index_head = head_group * 16 + (lane // 16) * 4 + e
-                        weight = lds_ld(keys, index_head).bitcast(fx.Float32)
-                        partial = (
-                            partial + fx.max(score_frag[e], fx.Float32(0.0)) * weight
-                        )
-                    if const_expr(index_fp8):
-                        # Rows this launch wrote came from the mailbox already
-                        # dequantized; only cache reads carry a scale.  The key
-                        # is lane % 16, which the two reductions below preserve,
-                        # so one factor per lane is correct either side of them.
-                        partial = partial * (safe_key >= first_position).select(
-                            fx.Float32(1.0), kv_scale
-                        )
-                    partial = _xred(partial, 16, lambda a, b: a + b)
-                    partial = _xred(partial, 32, lambda a, b: a + b)
-                    if lane < 16:
-                        lds_st(red, wave * 16 + lane, partial)
+                        partial = _xred(partial, 16, lambda a, b: a + b)
+                        partial = _xred(partial, 32, lambda a, b: a + b)
+                        if lane < 16:
+                            lds_st(red, u * 128 + wave * 16 + lane, partial)
                     gpu.barrier()
-                    if (wave % 2 == 0) & (lane < 16) & (key_pos < bound):
-                        score = lds_ld(red, wave * 16 + lane) + lds_ld(
-                            red, (wave + 1) * 16 + lane
-                        )
-                        if const_expr(indexer_cp):
-                            if bound <= LOCAL_INDEX_CAPACITY:
-                                lds_st(red, 128 + key_group * 16 + lane, score)
+                    for u in range_constexpr(SCORE_UNROLL):
+                        local_key, key_pos = tiles[u][0], tiles[u][1]
+                        if (wave % 2 == 0) & (lane < 16) & (key_pos < bound):
+                            score = lds_ld(red, u * 128 + wave * 16 + lane) + lds_ld(
+                                red, u * 128 + (wave + 1) * 16 + lane
+                            )
+                            if const_expr(indexer_cp):
+                                if bound <= LOCAL_INDEX_CAPACITY:
+                                    lds_st(red, 128 + key_group * 16 + lane, score)
+                                else:
+                                    put(
+                                        mb("index_scores"),
+                                        s * INDEX_CAPACITY + local_key,
+                                        score,
+                                    )
                             else:
                                 put(
                                     mb("index_scores"),
                                     s * INDEX_CAPACITY + local_key,
                                     score,
                                 )
-                        else:
-                            put(
-                                mb("index_scores"),
-                                s * INDEX_CAPACITY + local_key,
-                                score,
-                            )
                     if const_expr(indexer_cp):
                         if bound <= LOCAL_INDEX_CAPACITY:
                             # One wave per peer, one complete score exchange.

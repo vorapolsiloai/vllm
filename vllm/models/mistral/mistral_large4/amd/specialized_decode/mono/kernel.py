@@ -3695,18 +3695,35 @@ def build_ml4_monokernel(
                                         fx.Int32(j * SEG + i) for i in item_indices
                                     ]
                                 else:
-                                    idents = [
-                                        v[0]
-                                        for v in poll(
-                                            [
-                                                (
-                                                    src_ident,
-                                                    entry_pair(fx.min(i, n_in - 1)),
-                                                    1,
-                                                )
-                                                for i in item_indices
-                                            ]
+                                    # Polled lane-strided, so each load is one contiguous
+                                    # run of the identity plane, through the key words
+                                    # (free once every thread holds its keys) and read
+                                    # back thread-major.
+                                    gpu.barrier()
+                                    lane_items = [
+                                        tid + d * THREADS
+                                        for d in range_constexpr(items)
+                                    ]
+                                    lane_idents = poll(
+                                        [
+                                            (
+                                                src_ident,
+                                                entry_pair(fx.min(i, n_in - 1)),
+                                                1,
+                                            )
+                                            for i in lane_items
+                                        ]
+                                    )
+                                    for i, v in zip(lane_items, lane_idents):
+                                        lds_st(
+                                            xs, sel_slot(i), v[0].bitcast(fx.Float32)
                                         )
+                                    gpu.barrier()
+                                    idents = [
+                                        lds_ld(
+                                            xs, sel_slot(fx.min(i, n_in - 1))
+                                        ).bitcast(fx.Int32)
+                                        for i in item_indices
                                     ]
 
                                 def scan_flags(flags):

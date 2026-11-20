@@ -2353,150 +2353,129 @@ def build_ml4_monokernel(
             stamp("q_norm", s_norm, 4)
 
         # ================ 3. KV RMSNorm + k_pe RoPE -> cache (+ this launch's rows)
-        for t in range(start("cache"), 1, G):
+        # One task a row. The rows are independent and each consumer polls its own
+        # row, so one CTA writing every row in turn held the indexer and sparse
+        # attention behind the last row (and that CTA's own later tasks).
+        for t in range(start("cache"), S, G):
+            t = fx.Int32(t)
+            s = t
             stamp("cache", t, 0)
             r_kv = _rsrc(kv_cache)
             r_pe = _rsrc(pe_cache)
             # gamma and the RoPE factors are issued ahead of the wait
             g = ld_bf16(_rsrc(g_kv), tid)
             t_pe = tid % (PE_DIM // 2)
-            cs = [
-                ld_rope(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + t_pe)
-                for s in range(S)
-            ]
-            sns = [
-                ld_rope(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + t_pe)
-                for s in range(S)
-            ]
+            c = ld_rope(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + t_pe)
+            sn = ld_rope(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + t_pe)
             hint_wait(
                 (KV_LORA + PE_DIM) // QKV_A_TILE,
                 lambda k: (
                     mb("kv_a"),
-                    (S - 1) * (KV_LORA + PE_DIM) + k * QKV_A_TILE + QKV_A_TILE - 1,
+                    s * (KV_LORA + PE_DIM) + k * QKV_A_TILE + QKV_A_TILE - 1,
                 ),
                 mark=("cache", t),
             )
-            # every sample's kv latent and k_pe pair in one poll, one block reduction
-            vs = getf_many(
-                [(mb("kv_a"), s * (KV_LORA + PE_DIM) + tid) for s in range(S)]
-            )
-            pes = get2_many(
-                [
-                    (
-                        mb("kv_a"),
-                        s * (KV_LORA + PE_DIM) + KV_LORA + (tid % (PE_DIM // 2)) * 2,
-                    )
-                    for s in range(S)
-                ]
-            )
+            kv = getf(mb("kv_a"), s * (KV_LORA + PE_DIM) + tid)
+            kpe = get2(mb("kv_a"), s * (KV_LORA + PE_DIM) + KV_LORA + t_pe * 2)
             stamp("cache", t, 2)
             if const_expr(KV_SHARE):
                 # ML4 KV-sharing layer: no latent of its own. Attend to the source layer's cache, whose rows for this
                 # step were written earlier in the same step; never store into it.
-                for s in range_constexpr(S):
-                    pos = row_position(s)
-                    # A padded row (slot -1) has no source row: read slot 0 instead of
-                    # wrapping the 32-bit buffer offset ~4 GiB past the cache (memory
-                    # fault). Its kvnew is never read: patch_new_kv matches active rows only.
-                    slot = row_writes_cache(s).select(row_slot(s), fx.Int32(0))
+                pos = row_position(s)
+                # A padded row (slot -1) has no source row: read slot 0 instead of
+                # wrapping the 32-bit buffer offset ~4 GiB past the cache (memory
+                # fault). Its kvnew is never read: patch_new_kv matches active rows only.
+                slot = row_writes_cache(s).select(row_slot(s), fx.Int32(0))
+                if const_expr(cache_fp8):
+                    # fp8 implies the ATOM layout (asserted above): one byte per value
+                    kvn = ld_fp8(r_kv, slot * QK_DIM + tid)
+                elif const_expr(use_atom_kv_cache):
+                    kvn = ld_bf16(r_kv, slot * QK_DIM + tid)
+                else:
+                    kvn = ld_bf16(r_kv, pos * KV_LORA + tid)
+                put(mb("kvnew"), s * KV_LORA + tid, kvn)
+                if tid < PE_DIM // 2:
                     if const_expr(cache_fp8):
-                        # fp8 implies the ATOM layout (asserted above): one byte per value
-                        kvn = ld_fp8(r_kv, slot * QK_DIM + tid)
+                        p0, p1 = ld_fp8_pair(r_pe, (slot * QK_DIM + KV_LORA) // 2 + tid)
                     elif const_expr(use_atom_kv_cache):
-                        kvn = ld_bf16(r_kv, slot * QK_DIM + tid)
+                        p0 = ld_bf16(r_pe, slot * QK_DIM + KV_LORA + tid * 2)
+                        p1 = ld_bf16(r_pe, slot * QK_DIM + KV_LORA + tid * 2 + 1)
                     else:
-                        kvn = ld_bf16(r_kv, pos * KV_LORA + tid)
-                    put(mb("kvnew"), s * KV_LORA + tid, kvn)
-                    if tid < PE_DIM // 2:
-                        if const_expr(cache_fp8):
-                            p0, p1 = ld_fp8_pair(
-                                r_pe, (slot * QK_DIM + KV_LORA) // 2 + tid
-                            )
-                        elif const_expr(use_atom_kv_cache):
-                            p0 = ld_bf16(r_pe, slot * QK_DIM + KV_LORA + tid * 2)
-                            p1 = ld_bf16(r_pe, slot * QK_DIM + KV_LORA + tid * 2 + 1)
-                        else:
-                            p0 = ld_bf16(r_pe, pos * PE_DIM + tid * 2)
-                            p1 = ld_bf16(r_pe, pos * PE_DIM + tid * 2 + 1)
-                        put2(mb("penew"), s * PE_DIM + tid * 2, p0, p1)
+                        p0 = ld_bf16(r_pe, pos * PE_DIM + tid * 2)
+                        p1 = ld_bf16(r_pe, pos * PE_DIM + tid * 2 + 1)
+                    put2(mb("penew"), s * PE_DIM + tid * 2, p0, p1)
             else:
-                ssq = block_sums([v * v for v in vs])
-                for s in range_constexpr(S):
-                    pos = row_position(s)
-                    slot = row_slot(s)
-                    active = row_writes_cache(s)
-                    value = vs[s] * _rsq(ssq[s] * (1.0 / KV_LORA) + EPS) * g
+                ssq = block_sum(kv * kv)
+                pos = row_position(s)
+                slot = row_slot(s)
+                active = row_writes_cache(s)
+                value = kv * _rsq(ssq * (1.0 / KV_LORA) + EPS) * g
+                if const_expr(cache_fp8):
+                    # saturate like vLLM's fp8 cache writer (and torch): the
+                    # conversion turns |x| > FP8_MAX into NaN
+                    value = _fp8_sat(bf16_round(value))
+                    kvn, _ = _fp8_roundtrip(value, value)
+                else:
+                    kvn = bf16_round(value)
+                if const_expr(use_atom_kv_cache):
+                    if active:
+                        if const_expr(cache_fp8):
+                            pair = fx.Int32(
+                                rocdl.cvt_pk_fp8_f32(
+                                    T.i32, kvn, _xshfl(kvn, 1), fx.Int32(0), False
+                                )
+                            ) & fx.Int32(0xFFFF)
+                            upper_pair = bpermute_i32(
+                                fp8_kv_upper_pair_lane(lane) * 4, pair
+                            )
+                            if lane % 4 == 0:
+                                bo.buffer_store(
+                                    pair | (upper_pair << 16),
+                                    r_kv,
+                                    slot * (QK_DIM // 4) + tid // 4,
+                                )
+                        else:
+                            bo.buffer_store(
+                                kvn.to(fx.BFloat16), r_kv, slot * QK_DIM + tid
+                            )
+                else:
+                    bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_LORA + tid)
+                put(mb("kvnew"), s * KV_LORA + tid, kvn)
+                if tid < PE_DIM // 2:
+                    x0, x1 = kpe
+                    p0, p1 = x0 * c - x1 * sn, x0 * sn + x1 * c
                     if const_expr(cache_fp8):
-                        # saturate like vLLM's fp8 cache writer (and torch): the
-                        # conversion turns |x| > FP8_MAX into NaN
-                        value = _fp8_sat(bf16_round(value))
-                        kvn, _ = _fp8_roundtrip(value, value)
+                        p0 = _fp8_sat(bf16_round(p0))
+                        p1 = _fp8_sat(bf16_round(p1))
+                        p0, p1 = _fp8_roundtrip(p0, p1)
                     else:
-                        kvn = bf16_round(value)
+                        p0, p1 = bf16_round(p0), bf16_round(p1)
                     if const_expr(use_atom_kv_cache):
                         if active:
                             if const_expr(cache_fp8):
                                 pair = fx.Int32(
                                     rocdl.cvt_pk_fp8_f32(
-                                        T.i32, kvn, _xshfl(kvn, 1), fx.Int32(0), False
+                                        T.i32, p0, p1, fx.Int32(0), False
                                     )
                                 ) & fx.Int32(0xFFFF)
                                 upper_pair = bpermute_i32(
-                                    fp8_kv_upper_pair_lane(lane) * 4, pair
+                                    fp8_pe_upper_pair_lane(lane) * 4, pair
                                 )
-                                if lane % 4 == 0:
+                                if lane % 2 == 0:
                                     bo.buffer_store(
                                         pair | (upper_pair << 16),
-                                        r_kv,
-                                        slot * (QK_DIM // 4) + tid // 4,
+                                        r_pe,
+                                        slot * (QK_DIM // 4) + KV_LORA // 4 + tid // 2,
                                     )
                             else:
-                                bo.buffer_store(
-                                    kvn.to(fx.BFloat16), r_kv, slot * QK_DIM + tid
-                                )
+                                pe_offset = slot * QK_DIM + KV_LORA + tid * 2
+                                bo.buffer_store(p0.to(fx.BFloat16), r_pe, pe_offset)
+                                bo.buffer_store(p1.to(fx.BFloat16), r_pe, pe_offset + 1)
                     else:
-                        bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_LORA + tid)
-                    put(mb("kvnew"), s * KV_LORA + tid, kvn)
-                    if tid < PE_DIM // 2:
-                        x0, x1 = pes[s]
-                        c, sn = cs[s], sns[s]
-                        p0, p1 = x0 * c - x1 * sn, x0 * sn + x1 * c
-                        if const_expr(cache_fp8):
-                            p0 = _fp8_sat(bf16_round(p0))
-                            p1 = _fp8_sat(bf16_round(p1))
-                            p0, p1 = _fp8_roundtrip(p0, p1)
-                        else:
-                            p0, p1 = bf16_round(p0), bf16_round(p1)
-                        if const_expr(use_atom_kv_cache):
-                            if active:
-                                if const_expr(cache_fp8):
-                                    pair = fx.Int32(
-                                        rocdl.cvt_pk_fp8_f32(
-                                            T.i32, p0, p1, fx.Int32(0), False
-                                        )
-                                    ) & fx.Int32(0xFFFF)
-                                    upper_pair = bpermute_i32(
-                                        fp8_pe_upper_pair_lane(lane) * 4, pair
-                                    )
-                                    if lane % 2 == 0:
-                                        bo.buffer_store(
-                                            pair | (upper_pair << 16),
-                                            r_pe,
-                                            slot * (QK_DIM // 4)
-                                            + KV_LORA // 4
-                                            + tid // 2,
-                                        )
-                                else:
-                                    pe_offset = slot * QK_DIM + KV_LORA + tid * 2
-                                    bo.buffer_store(p0.to(fx.BFloat16), r_pe, pe_offset)
-                                    bo.buffer_store(
-                                        p1.to(fx.BFloat16), r_pe, pe_offset + 1
-                                    )
-                        else:
-                            pe_offset = pos * PE_DIM + tid * 2
-                            bo.buffer_store(p0.to(fx.BFloat16), r_pe, pe_offset)
-                            bo.buffer_store(p1.to(fx.BFloat16), r_pe, pe_offset + 1)
-                        put2(mb("penew"), s * PE_DIM + tid * 2, p0, p1)
+                        pe_offset = pos * PE_DIM + tid * 2
+                        bo.buffer_store(p0.to(fx.BFloat16), r_pe, pe_offset)
+                        bo.buffer_store(p1.to(fx.BFloat16), r_pe, pe_offset + 1)
+                    put2(mb("penew"), s * PE_DIM + tid * 2, p0, p1)
 
             if const_expr(with_indexer):
                 # Index keys use LayerNorm (not RMSNorm), interleaved RoPE on
@@ -2505,118 +2484,109 @@ def build_ml4_monokernel(
                 # transform to Q and K leaves their dot products unchanged.
                 r_gik, r_bik = _rsrc(index_arg(5)), _rsrc(index_arg(6))
                 r_index_cache = _rsrc(indices)
-                for s in range_constexpr(S):
-                    # Same gate the MLA kv/pe writes above use: a pad row has
-                    # slot_mapping -1 and row_position 0, so an ungated store
-                    # would land on row 0 of whatever page this request's block
-                    # table happens to point at and clobber a live request's
-                    # position-0 index key. The mailbox publishes below stay
-                    # ungated -- index_score polls every row.
-                    active = row_writes_cache(s)
-                    ik = getf(mb("index_k"), s * INDEX_DIM + fx.min(tid, INDEX_DIM - 1))
-                    live = tid < INDEX_DIM
-                    iv = live.select(ik, fx.Float32(0.0))
-                    mean = block_sum(iv) * (1.0 / INDEX_DIM)
-                    centered = live.select(ik - mean, fx.Float32(0.0))
-                    rstd = _rsq(
-                        block_sum(centered * centered) * (1.0 / INDEX_DIM) + 1.0e-6
+                # Same gate the MLA kv/pe writes above use: a pad row has
+                # slot_mapping -1 and row_position 0, so an ungated store
+                # would land on row 0 of whatever page this request's block
+                # table happens to point at and clobber a live request's
+                # position-0 index key. The mailbox publishes below stay
+                # ungated -- index_score polls every row.
+                active = row_writes_cache(s)
+                ik = getf(mb("index_k"), s * INDEX_DIM + fx.min(tid, INDEX_DIM - 1))
+                live = tid < INDEX_DIM
+                iv = live.select(ik, fx.Float32(0.0))
+                mean = block_sum(iv) * (1.0 / INDEX_DIM)
+                centered = live.select(ik - mean, fx.Float32(0.0))
+                rstd = _rsq(block_sum(centered * centered) * (1.0 / INDEX_DIM) + 1.0e-6)
+                if tid < INDEX_DIM // 2:
+                    i0 = tid * 2
+                    k0, k1 = get2(mb("index_k"), s * INDEX_DIM + i0)
+                    v0 = (k0 - mean) * rstd * ld_f32(r_gik, i0) + ld_f32(r_bik, i0)
+                    v1 = (k1 - mean) * rstd * ld_f32(r_gik, i0 + 1) + ld_f32(
+                        r_bik, i0 + 1
                     )
-                    if tid < INDEX_DIM // 2:
-                        i0 = tid * 2
-                        k0, k1 = get2(mb("index_k"), s * INDEX_DIM + i0)
-                        v0 = (k0 - mean) * rstd * ld_f32(r_gik, i0) + ld_f32(r_bik, i0)
-                        v1 = (k1 - mean) * rstd * ld_f32(r_gik, i0 + 1) + ld_f32(
-                            r_bik, i0 + 1
+                    if const_expr(INDEX_ROPE):
+                        if tid < PE_DIM // 2:
+                            v0, v1 = v0 * c - v1 * sn, v0 * sn + v1 * c
+                    if const_expr(index_fp8):
+                        # ATOM's plane: the production writer rounds the
+                        # roped key back through bf16, takes one ue8m0 scale
+                        # over the row's own 128 values, and stores E4M3
+                        # bytes preshuffled into MFMA 16x16 tiles with the
+                        # fp32 scales in a separate per-page segment.
+                        v0, v1 = bf16_round(v0), bf16_round(v1)
+                        amax = fx.max(
+                            wave_max(fx.max(fmath.absf(v0), fmath.absf(v1))),
+                            fx.Float32(1.0e-4),
                         )
-                        if const_expr(INDEX_ROPE):
-                            if tid < PE_DIM // 2:
-                                c, sn = cs[s], sns[s]
-                                v0, v1 = v0 * c - v1 * sn, v0 * sn + v1 * c
-                        if const_expr(index_fp8):
-                            # ATOM's plane: the production writer rounds the
-                            # roped key back through bf16, takes one ue8m0 scale
-                            # over the row's own 128 values, and stores E4M3
-                            # bytes preshuffled into MFMA 16x16 tiles with the
-                            # fp32 scales in a separate per-page segment.
-                            v0, v1 = bf16_round(v0), bf16_round(v1)
-                            amax = fx.max(
-                                wave_max(fx.max(fmath.absf(v0), fmath.absf(v1))),
-                                fx.Float32(1.0e-4),
-                            )
-                            # exp2(ceil(log2(amax / 448))) as an exact statement
-                            # about the exponent field: amax = m * 2**a with
-                            # m <= 1.75 gives 2**(a - 8), m > 1.75 gives
-                            # 2**(a - 7).  No divide, no log2, so no 1-ulp slip
-                            # across a power of two -- which would halve a row.
-                            bits = amax.bitcast(fx.Int32)
-                            exponent = ((bits >> 23) & fx.Int32(0xFF)) - 8
-                            exponent = exponent + (
-                                (bits & fx.Int32(0x7FFFFF)) > fx.Int32(0x600000)
-                            ).select(fx.Int32(1), fx.Int32(0))
-                            exponent = fx.max(
-                                fx.min(exponent, fx.Int32(254)), fx.Int32(1)
-                            )
-                            qs = (exponent << 23).bitcast(fx.Float32)
-                            inv = ((fx.Int32(254) - exponent) << 23).bitcast(fx.Float32)
-                            q0 = fx.min(fx.max(v0 * inv, -FP8_MAX), FP8_MAX)
-                            q1 = fx.min(fx.max(v1 * inv, -FP8_MAX), FP8_MAX)
-                            page, row = index_page_cell(s, row_position(s))
-                            pair = fx.Int32(
-                                rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)
-                            ) & fx.Int32(0xFFFF)
-                            upper_pair = bpermute_i32(
-                                fp8_pe_upper_pair_lane(lane) * 4, pair
-                            )
-                            if active:
-                                if lane % 2 == 0:
-                                    bo.buffer_store(
-                                        pair | (upper_pair << 16),
-                                        r_index_cache,
-                                        index_fp8_data_dword(
-                                            page, row, i0, index_page_size
-                                        ),
-                                    )
-                                if tid == 0:
-                                    bo.buffer_store(
-                                        qs,
-                                        r_index_cache,
-                                        index_fp8_scale_dword(
-                                            page, row, index_page_size
-                                        ),
-                                    )
-                            # Consumer: the index_score stage's own-row branch
-                            # (`safe_key >= first_position`, below, which selects
-                            # the mailbox over a cache read precisely for the
-                            # key positions this very launch just wrote and that
-                            # r_index_cache is not yet guaranteed to reflect this
-                            # step). Publish the dequantized value, not raw v0/v1,
-                            # so those keys score at the same E4M3 precision a
-                            # cache read would give them -- production never
-                            # scores a key that bypassed quantization, and the
-                            # BF16 arm has no such gap because it has no
-                            # quantization step to bypass. qs is a power of two,
-                            # so bf16(q * qs) is bit-identical to the cache read
-                            # times qs, not merely close to it.
-                            d0, d1 = _fp8_roundtrip(q0, q1)
-                            put_bf(
-                                mb("index_k_new"),
-                                s * INDEX_DIM + i0,
-                                [d0 * qs, d1 * qs],
-                            )
-                        else:
-                            if active:
+                        # exp2(ceil(log2(amax / 448))) as an exact statement
+                        # about the exponent field: amax = m * 2**a with
+                        # m <= 1.75 gives 2**(a - 8), m > 1.75 gives
+                        # 2**(a - 7).  No divide, no log2, so no 1-ulp slip
+                        # across a power of two -- which would halve a row.
+                        bits = amax.bitcast(fx.Int32)
+                        exponent = ((bits >> 23) & fx.Int32(0xFF)) - 8
+                        exponent = exponent + (
+                            (bits & fx.Int32(0x7FFFFF)) > fx.Int32(0x600000)
+                        ).select(fx.Int32(1), fx.Int32(0))
+                        exponent = fx.max(fx.min(exponent, fx.Int32(254)), fx.Int32(1))
+                        qs = (exponent << 23).bitcast(fx.Float32)
+                        inv = ((fx.Int32(254) - exponent) << 23).bitcast(fx.Float32)
+                        q0 = fx.min(fx.max(v0 * inv, -FP8_MAX), FP8_MAX)
+                        q1 = fx.min(fx.max(v1 * inv, -FP8_MAX), FP8_MAX)
+                        page, row = index_page_cell(s, row_position(s))
+                        pair = fx.Int32(
+                            rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)
+                        ) & fx.Int32(0xFFFF)
+                        upper_pair = bpermute_i32(
+                            fp8_pe_upper_pair_lane(lane) * 4, pair
+                        )
+                        if active:
+                            if lane % 2 == 0:
                                 bo.buffer_store(
-                                    fx.Vector.from_elements([v0, v1], fx.Float32).to(
-                                        fx.BFloat16
-                                    ),
+                                    pair | (upper_pair << 16),
                                     r_index_cache,
-                                    index_page_slot(s, row_position(s)) * INDEX_DIM
-                                    + i0,
+                                    index_fp8_data_dword(
+                                        page, row, i0, index_page_size
+                                    ),
                                 )
-                            put_bf(mb("index_k_new"), s * INDEX_DIM + i0, [v0, v1])
-                    gpu.barrier()
-                    if tid == 0:
-                        put(mb("index_ready"), s, fx.Int32(1))
+                            if tid == 0:
+                                bo.buffer_store(
+                                    qs,
+                                    r_index_cache,
+                                    index_fp8_scale_dword(page, row, index_page_size),
+                                )
+                        # Consumer: the index_score stage's own-row branch
+                        # (`safe_key >= first_position`, below, which selects
+                        # the mailbox over a cache read precisely for the
+                        # key positions this very launch just wrote and that
+                        # r_index_cache is not yet guaranteed to reflect this
+                        # step). Publish the dequantized value, not raw v0/v1,
+                        # so those keys score at the same E4M3 precision a
+                        # cache read would give them -- production never
+                        # scores a key that bypassed quantization, and the
+                        # BF16 arm has no such gap because it has no
+                        # quantization step to bypass. qs is a power of two,
+                        # so bf16(q * qs) is bit-identical to the cache read
+                        # times qs, not merely close to it.
+                        d0, d1 = _fp8_roundtrip(q0, q1)
+                        put_bf(
+                            mb("index_k_new"),
+                            s * INDEX_DIM + i0,
+                            [d0 * qs, d1 * qs],
+                        )
+                    else:
+                        if active:
+                            bo.buffer_store(
+                                fx.Vector.from_elements([v0, v1], fx.Float32).to(
+                                    fx.BFloat16
+                                ),
+                                r_index_cache,
+                                index_page_slot(s, row_position(s)) * INDEX_DIM + i0,
+                            )
+                        put_bf(mb("index_k_new"), s * INDEX_DIM + i0, [v0, v1])
+                gpu.barrier()
+                if tid == 0:
+                    put(mb("index_ready"), s, fx.Int32(1))
             stamp("cache", t, 4)
 
         # =============================================== 4. normalized q_a -> q_b (+RoPE)

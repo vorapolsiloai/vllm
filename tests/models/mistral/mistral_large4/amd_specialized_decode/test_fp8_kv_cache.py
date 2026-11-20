@@ -272,6 +272,95 @@ def test_index_scores_cover_each_context():
         kernel.close()
 
 
+LONG_PAGES = 2048  # 131072 keys: eight 16384-key selector leaves
+
+
+@functools.cache
+def long_caches():
+    """Latent cache, fp8 index cache and RoPE tables of LONG_PAGES pages."""
+    torch.manual_seed(2)
+    base = vllm_fp8_rows(_randn(LONG_PAGES * PAGE, QK, scale=0.5))
+    keys = _randn(LONG_PAGES, PAGE * 128, scale=0.5).to(FP8).view(torch.uint8)
+    scales = torch.ones(LONG_PAGES, PAGE, device="cuda").view(torch.uint8)
+    index_cache = torch.cat([keys, scales], 1).view(LONG_PAGES, PAGE, 132)
+    freqs = 10000 ** (-torch.arange(32, device="cuda") / 32)
+    ang = torch.arange(LONG_PAGES * PAGE, device="cuda")[:, None] * freqs[None]
+    cos, sin = torch.cos(ang).contiguous(), torch.sin(ang).contiguous()
+    return base, index_cache.contiguous(), cos, sin
+
+
+def long_decode(rows):
+    """Rope-layer kernel of `rows` plain decode rows over the long caches."""
+    v, W = build_layer("rope")
+    return v.op.Ml4MonoKernel(
+        W, rows, rank=0, npes=1, group=None, topk=TOPK, launches_per_step=1,
+        with_indexer=True, index_max_seq=LONG_PAGES * PAGE, index_request_width=1,
+        index_page_size=PAGE, index_block_table_stride=LONG_PAGES,
+        index_cache_dtype="fp8", attention_weight="fp8_block128",
+        kv_cache_layout="atom", kv_cache_dtype="fp8",
+        native_fp4_mfma=True, rope_dtype="fp32", separate_shared=True,
+    )  # fmt: skip
+
+
+def index_step(kernel, h, ctx, tables):
+    """One step of len(ctx) requests, a row each: every row's index scores,
+    their mailbox tags and the keys its selector picked."""
+    base, index_cache, cos, sin = long_caches()
+    rows, seq = len(ctx), LONG_PAGES * PAGE
+    positions = ctx - 1
+    slots = tables[torch.arange(rows), positions // PAGE].long() * PAGE
+    slots += positions % PAGE
+    nkeys = torch.clamp(ctx, max=TOPK)
+    indptr = torch.cat([nkeys.new_zeros(1), nkeys.cumsum(0)]).int()
+    kv = base.clone()
+    kernel.forward(
+        h, torch.tensor([POS0], dtype=torch.int32, device="cuda"), kv, kv, None,
+        cos, sin, index_cache=index_cache.clone(), block_tables=tables,
+        positions=positions, slot_mapping=slots, sparse_kv_indptr=indptr,
+    )  # fmt: skip
+    torch.accelerator.synchronize()
+    off = kernel.scr_layout["index_scores"]
+    pairs = kernel.scratch[off : off + rows * seq * 8].view(torch.int32)
+    off = kernel.scr_layout["indices"]
+    picked = kernel.scratch[off : off + rows * TOPK * 4].view(torch.int32)
+    pairs = pairs.view(rows, seq, 2).clone()
+    return pairs[..., 0].view(torch.float32), pairs[..., 1], picked.view(rows, -1)
+
+
+@torch.inference_mode()
+def test_index_select_long_contexts():
+    """Plain decode of S requests with contexts past one 16384-key selector
+    leaf: each CTA scores several key tiles of one row, and the selector merges
+    the leaves' lists. Each row's scores cover its own context and equal those
+    of the same request decoded alone; its picked keys are its TOPK best."""
+    ctx = torch.tensor([40000, 16385, 3000, 20000], device="cuda")
+    need = (ctx + PAGE - 1) // PAGE
+    pages = torch.randperm(LONG_PAGES, device="cuda", dtype=torch.int32)
+    tables = torch.zeros(S, LONG_PAGES, dtype=torch.int32, device="cuda")
+    for s in range(S):
+        start = int(need[:s].sum())
+        tables[s, : need[s]] = pages[start : start + int(need[s])]
+    h = _randn(S, HIDDEN).to(torch.bfloat16)
+    with long_decode(S) as kernel:
+        scores, tags, picked = index_step(kernel, h, ctx, tables)
+        picked = picked.long()
+    live = tags[0, 0].item()
+    assert live != 0
+    with long_decode(1) as kernel:
+        for s in range(S):
+            n = int(ctx[s])
+            assert (tags[s, :n] == live).all(), s
+            assert (tags[s, n:] == 0).all(), s
+            own = scores[s, :n]
+            alone = index_step(kernel, h[s : s + 1], ctx[s : s + 1], tables[s : s + 1])
+            assert torch.equal(own, alone[0][0, :n]), s
+            assert picked[s].unique().numel() == TOPK, s
+            assert int(picked[s].max()) < n, s
+            kth = own.topk(TOPK).values[-1]
+            assert (own[picked[s]] >= kth).all(), s
+            assert torch.isin((own > kth).nonzero().flatten(), picked[s]).all(), s
+
+
 @pytest.mark.parametrize("kind", ("rope", "nope"))
 @torch.inference_mode()
 def test_fp8_cache_saturates(kind):

@@ -1485,6 +1485,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kept tokens only, dense causal MHA for the others over their latent read
         back from the cache (a KV-sharing layer has no latent of its own)."""
         keep, ids = dense_prefix.keep, dense_prefix.ids
+        out = output.new_empty((keep.numel() + ids.numel(), output.shape[-1]))
         if keep.numel():
             mqa_metadata = dense_prefix.mqa_metadata
             mqa_q = self._prepare_mqa_query(
@@ -1493,24 +1494,23 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 fused_q_heads=self._fused_decode_query_heads(mqa_metadata),
             )
             attn_out, _ = self.impl.forward_mqa(mqa_q, kv_cache, mqa_metadata, self)  # type: ignore[attr-defined]
-            mqa_out = output.new_empty((keep.numel(), output.shape[-1]))
-            self._v_up_proj(attn_out, out=mqa_out)
-            output.index_copy_(0, keep, mqa_out)
-        kv = kv_cache[dense_prefix.kv_index]  # [tokens, kv_lora_rank + rope dim]
-        if fp8_attention:
-            kv = kv.to(q.dtype).mul_(self._k_scale)
-        kv_c, kv_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
-        dense_out = output.new_empty((ids.numel(), output.shape[-1]))
+            self._v_up_proj(attn_out, out=out[: keep.numel()])
+        kv = kv_cache.view(-1, kv_cache.shape[-1]).index_select(0, dense_prefix.slots)
+        kv_c, k_pe = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)
+        if fp8_attention:  # the casts also make kv_c contiguous for kv_b_proj
+            kv_c, k_pe = kv_c.to(q.dtype), k_pe.to(q.dtype)
+            if self._k_scale_float != 1.0:
+                kv_c, k_pe = kv_c.mul_(self._k_scale), k_pe.mul_(self._k_scale)
         self.impl.forward_mha(  # type: ignore[attr-defined]
             q.index_select(0, ids),
             kv_c.contiguous(),
-            kv_pe.unsqueeze(1),
+            k_pe.unsqueeze(1),
             kv_cache,
             dense_prefix.mha_metadata,
             self._k_scale,
-            output=dense_out,
+            output=out[keep.numel() :],
         )
-        output.index_copy_(0, ids, dense_out)
+        torch.index_select(out, 0, dense_prefix.rows, out=output)
 
     def _use_sparse_mha(self, attn_metadata: "MLACommonMetadata") -> bool:
         prefill = attn_metadata.prefill

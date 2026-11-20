@@ -3450,6 +3450,13 @@ def build_ml4_monokernel(
                 FAN = INDEX_FAN
                 DEPTH = INDEX_DEPTH
                 SEL_ITEMS = (SEG + THREADS - 1) // THREADS
+
+                def sel_slot(i):
+                    """LDS word of staged key ``i``, XOR-swizzled over the 32 banks: the
+                    compaction reads each thread's ``SEL_ITEMS`` consecutive keys, which
+                    unswizzled all sit in one bank (a 64-way conflict per read)."""
+                    return i ^ ((i >> 5) & 31)
+
                 # Row stride of the level-0 source.  A CP build reads the
                 # peer-exchanged plane, which is one leaf wide; everything else
                 # reads the scorer's own plane, which is the whole context.
@@ -3559,7 +3566,7 @@ def build_ml4_monokernel(
                                         # The selector CTA no longer needs the large GEMV staging
                                         # region, so reuse it for the 4-K radix keys instead of
                                         # increasing the monokernel's LDS allocation.
-                                        lds_st(xs, i, key.bitcast(fx.Float32))
+                                        lds_st(xs, sel_slot(i), key.bitcast(fx.Float32))
                                         digit = fx.Int32(
                                             (fx.Uint32(key) >> 24) & fx.Uint32(255)
                                         )
@@ -3614,7 +3621,9 @@ def build_ml4_monokernel(
                                             # The selector CTA no longer needs the large GEMV
                                             # staging region, so reuse it for the 4-K radix keys
                                             # instead of growing the monokernel's LDS allocation.
-                                            lds_st(xs, i, key.bitcast(fx.Float32))
+                                            lds_st(
+                                                xs, sel_slot(i), key.bitcast(fx.Float32)
+                                            )
                                             digit = fx.Int32(
                                                 (fx.Uint32(key) >> 24) & fx.Uint32(255)
                                             )
@@ -3636,7 +3645,9 @@ def build_ml4_monokernel(
                                         i = tid + batch * THREADS
                                         if i < n_in:
                                             key = fx.Uint32(
-                                                lds_ld(xs, i).bitcast(fx.Int32)
+                                                lds_ld(xs, sel_slot(i)).bitcast(
+                                                    fx.Int32
+                                                )
                                             )
                                             if (key & fx.Uint32(prefix_mask)) == prefix:
                                                 digit = fx.Int32(
@@ -3658,7 +3669,9 @@ def build_ml4_monokernel(
                                     tid * items + d for d in range_constexpr(items)
                                 ]
                                 item_bits = [
-                                    lds_ld(xs, fx.min(i, n_in - 1)).bitcast(fx.Int32)
+                                    lds_ld(xs, sel_slot(fx.min(i, n_in - 1))).bitcast(
+                                        fx.Int32
+                                    )
                                     for i in item_indices
                                 ]
                                 item_keys = [fx.Uint32(b) for b in item_bits]

@@ -440,3 +440,55 @@ def test_indexer_q_clears_topk(rope):
     torch.testing.assert_close(topk_indices, expected, atol=0, rtol=0)
     assert torch.equal(q_fp8.view(torch.uint8), q_fp8_ref.view(torch.uint8))
     torch.testing.assert_close(w, w_ref, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm indexer op")
+@pytest.mark.parametrize("skip_clear", [False, True])
+def test_rocm_indexer_op_topk_clear(skip_clear: bool):
+    # With the fused K cache write, the Q kernel above clears the top-k rows,
+    # so the indexer op must leave them as they are, as the CUDA op does.
+    from vllm.forward_context import set_forward_context
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        rocm_aiter_sparse_attn_indexer,
+    )
+
+    num_tokens, num_heads, head_dim, topk = 5, 32, 128, 2048
+    prefix = "model.layers.0.attn.indexer.k_cache"
+    no_requests = DeepseekV32IndexerMetadata(
+        seq_lens=torch.empty(0, dtype=torch.int32, device=DEVICE),
+        max_seq_len=0,
+        slot_mapping=torch.empty(0, dtype=torch.int64, device=DEVICE),
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_prefills=0,
+        num_prefill_tokens=0,
+    )
+    topk_indices = torch.arange(8 * topk, dtype=torch.int32, device=DEVICE)
+    topk_indices = topk_indices.view(8, topk)
+    expected = topk_indices.clone()
+    if not skip_clear:
+        expected[:num_tokens] = -1
+
+    q_fp8 = torch.empty(num_tokens, num_heads, head_dim, device=DEVICE).to(
+        current_platform.fp8_dtype()
+    )
+    with set_forward_context({prefix: no_requests}, _eager_config()):
+        rocm_aiter_sparse_attn_indexer(
+            torch.empty(num_tokens, 64, device=DEVICE, dtype=torch.bfloat16),
+            prefix,
+            torch.empty(0, device=DEVICE, dtype=torch.uint8),
+            q_fp8,
+            None,
+            torch.empty(num_tokens, num_heads, device=DEVICE),
+            128,
+            "ue8m0",
+            topk,
+            head_dim,
+            4096,
+            4096,
+            topk_indices,
+            skip_k_cache_insert=True,
+            skip_topk_buffer_clear=skip_clear,
+        )
+    torch.testing.assert_close(topk_indices, expected, atol=0, rtol=0)

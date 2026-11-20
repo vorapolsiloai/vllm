@@ -1372,6 +1372,7 @@ def rocm_aiter_sparse_attn_indexer_fake(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_interleave: int = 1,
+    skip_topk_buffer_clear: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -1402,6 +1403,7 @@ def rocm_aiter_sparse_attn_indexer(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_interleave: int = 1,
+    skip_topk_buffer_clear: bool = False,
 ) -> torch.Tensor:
     from vllm._aiter_ops import rocm_aiter_ops
     from vllm.model_executor.layers.sparse_attn_indexer import _merge_dcp_topk_global
@@ -1493,7 +1495,10 @@ def rocm_aiter_sparse_attn_indexer(
     has_decode = layer_attn_metadata.num_decodes > 0
     has_prefill = layer_attn_metadata.num_prefills > 0
     num_decode_tokens = layer_attn_metadata.num_decode_tokens
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # Pre-fill with the -1 "no token" sentinel unless the caller already cleared
+    # [:num_tokens] earlier in this forward (as on the CUDA path).
+    if not skip_topk_buffer_clear:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
 
     # during speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens.

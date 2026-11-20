@@ -2924,6 +2924,7 @@ def build_ml4_monokernel(
                     // INDEX_KEYS_PER_TASK,
                 )
             live_tiles = fx.min(live_tiles, fx.Int32(N_INDEX_SPLIT))
+            STAGE_BELOW = G if G % S == 0 else N_INDEX_SPLIT * S
             for tt in range(start("index_score"), live_tiles * S, G):
                 tt = fx.Int32(tt)
                 s = tt % S
@@ -2934,54 +2935,59 @@ def build_ml4_monokernel(
                 first_position = row_position(request_start)
                 shard_begin, shard_size = index_shard(s)
                 if tile * INDEX_KEYS_PER_TASK < shard_size:
-                    get(mb("index_ready"), s)
-                    if tid < INDEX_HEADS:
-                        lds_st(keys, tid, get(mb("index_w"), s * INDEX_HEADS + tid))
-                    # Every key group reuses the same 32x128 query.  Stage and RoPE
-                    # it once per scoring CTA instead of polling and rotating it in
-                    # each of the four key-group wave pairs.
-                    # Peer reads benefit from independent outstanding polls.
-                    # Keep the original one-pair staging order when CP is off.
-                    q_batch = (INDEX_Q_ROWS // 2) // THREADS if indexer_cp else 1
-                    for batch in range_constexpr(
-                        0, (INDEX_Q_ROWS // 2) // THREADS, q_batch
-                    ):
-                        q_pairs = [tid + (batch + b) * THREADS for b in range(q_batch)]
-                        q_source = (
-                            cp_buffer("index_cp_q", sym)
-                            if const_expr(SHARD_INDEX_Q)
-                            else mb("index_q")
-                        )
-                        q_words = poll(
-                            [
-                                (q_source, s * INDEX_Q_ROWS // 2 + pair, 1)
-                                for pair in q_pairs
-                            ],
-                            scope="system" if SHARD_INDEX_Q else "agent",
-                        )
-                        for q_pair, q_word in zip(q_pairs, q_words):
-                            q_elem = q_pair * 2
-                            kq = q_elem % INDEX_DIM
-                            q0, q1 = bf2_f32(q_word[0])
-                            iss = ml4_ssmax(
-                                row_position(s),
-                                ML4_P_ISS_S,
-                                ML4_P_ISS_B,
-                                q_elem // INDEX_DIM,
+                    # A CTA's tasks are t, t + G, ...: when S divides G they all score one
+                    # row, so its head weights and roped query are staged at its first task.
+                    if tt < STAGE_BELOW:
+                        get(mb("index_ready"), s)
+                        if tid < INDEX_HEADS:
+                            lds_st(keys, tid, get(mb("index_w"), s * INDEX_HEADS + tid))
+                        # Every key group reuses the same 32x128 query.  Stage and RoPE
+                        # it once per scoring CTA instead of polling and rotating it in
+                        # each of the four key-group wave pairs.
+                        # Peer reads benefit from independent outstanding polls.
+                        # Keep the original one-pair staging order when CP is off.
+                        q_batch = (INDEX_Q_ROWS // 2) // THREADS if indexer_cp else 1
+                        for batch in range_constexpr(
+                            0, (INDEX_Q_ROWS // 2) // THREADS, q_batch
+                        ):
+                            q_pairs = [
+                                tid + (batch + b) * THREADS for b in range(q_batch)
+                            ]
+                            q_source = (
+                                cp_buffer("index_cp_q", sym)
+                                if const_expr(SHARD_INDEX_Q)
+                                else mb("index_q")
                             )
-                            q0, q1 = bf16_round(q0 * iss), bf16_round(q1 * iss)
-                            if const_expr(INDEX_ROPE):
-                                if kq < PE_DIM:
-                                    c = ld_rope(
-                                        _rsrc(rope_cos),
-                                        row_position(s) * (PE_DIM // 2) + kq // 2,
-                                    )
-                                    sn = ld_rope(
-                                        _rsrc(rope_sin),
-                                        row_position(s) * (PE_DIM // 2) + kq // 2,
-                                    )
-                                    q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
-                            lds_st(xs, q_pair, bf16_pair(q0, q1))
+                            q_words = poll(
+                                [
+                                    (q_source, s * INDEX_Q_ROWS // 2 + pair, 1)
+                                    for pair in q_pairs
+                                ],
+                                scope="system" if SHARD_INDEX_Q else "agent",
+                            )
+                            for q_pair, q_word in zip(q_pairs, q_words):
+                                q_elem = q_pair * 2
+                                kq = q_elem % INDEX_DIM
+                                q0, q1 = bf2_f32(q_word[0])
+                                iss = ml4_ssmax(
+                                    row_position(s),
+                                    ML4_P_ISS_S,
+                                    ML4_P_ISS_B,
+                                    q_elem // INDEX_DIM,
+                                )
+                                q0, q1 = bf16_round(q0 * iss), bf16_round(q1 * iss)
+                                if const_expr(INDEX_ROPE):
+                                    if kq < PE_DIM:
+                                        c = ld_rope(
+                                            _rsrc(rope_cos),
+                                            row_position(s) * (PE_DIM // 2) + kq // 2,
+                                        )
+                                        sn = ld_rope(
+                                            _rsrc(rope_sin),
+                                            row_position(s) * (PE_DIM // 2) + kq // 2,
+                                        )
+                                        q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
+                                lds_st(xs, q_pair, bf16_pair(q0, q1))
                     gpu.barrier()
                     key_group = wave // 2
                     head_group = wave % 2

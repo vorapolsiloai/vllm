@@ -2941,10 +2941,23 @@ def build_ml4_monokernel(
                 )
                 return words.bitcast(fx.BFloat16)
 
-            for tt in range(start("index_score"), S * N_INDEX_SPLIT, G):
+            # Only key tiles inside some row's context do work.  Walking the
+            # build's whole capacity (max_model_len / 64 tiles a row) costs every
+            # CTA an empty iteration per tile, and a stride of N_INDEX_SPLIT puts
+            # every row's live tiles on the same CTAs.  Tile-major over the live
+            # tiles instead: the step's longest context sets the loop bound.
+            live_tiles = fx.Int32(1)
+            for s_row in range_constexpr(S):
+                live_tiles = fx.max(
+                    live_tiles,
+                    (index_shard(fx.Int32(s_row))[1] + INDEX_KEYS_PER_TASK - 1)
+                    // INDEX_KEYS_PER_TASK,
+                )
+            live_tiles = fx.min(live_tiles, fx.Int32(N_INDEX_SPLIT))
+            for tt in range(start("index_score"), live_tiles * S, G):
                 tt = fx.Int32(tt)
-                s = tt // N_INDEX_SPLIT
-                tile = tt % N_INDEX_SPLIT
+                s = tt % S
+                tile = tt // S
                 stamp("index_score", tt, 0)
                 bound = row_position(s) + 1
                 request_start = index_request_start(s)

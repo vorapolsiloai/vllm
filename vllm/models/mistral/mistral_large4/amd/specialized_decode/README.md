@@ -1,6 +1,6 @@
 # Mistral Large 4 specialized decode (MI350X / MI355X)
 
-An opt-in decode path for Mistral Large 4 at TP4 on gfx950, following
+An opt-in decode path for Mistral Large 4 at TP4 or TP8 on gfx950, following
 RFC #60904. A pure decode step of 1, 2 or 4 requests (one token each) runs
 every MoE decoder layer (1-71) as one persistent FlyDSL MonoKernel launch (256
 CTAs, all resident), in "step mode": the specialized decode runs the whole
@@ -31,16 +31,16 @@ options.
 
 ## Supported deployments
 
-TP4 on gfx950 with all 256 CUs; Model Runner V2; a latent KV cache in FP8
+TP4 or TP8 on gfx950 with all 256 CUs; Model Runner V2; a latent KV cache in FP8
 (E4M3 with KV scale 1.0, the ROCm default) or bf16, with a block size that is a
 multiple of 16 (the DSA indexer's FP8 key cache shares its block ids); routed
 experts in AITER's a4w4 MXFP4 storage (`AITER_MXFP4_MXFP4`,
 e.g. the block-FP8 checkpoint re-quantized at load as above). The kernels read
 the routed experts and both caches in place. The attention, indexer and router
-weights are repacked into the kernels' tiled formats (4.17 GiB per rank) and
-the shared expert is re-quantized to MXFP4 with the same quantizer; this
-happens after load, before vLLM's memory profiling, so the KV cache is sized
-with it.
+weights are repacked into the kernels' tiled formats (4.17 GiB per rank at TP4,
+2.78 GiB at TP8) and the shared expert is re-quantized to MXFP4 with the same
+quantizer; this happens after load, before vLLM's memory profiling, so the KV
+cache is sized with it.
 
 If the specialized decode is requested for anything else, startup fails with
 one `ValueError` listing every reason (default-deny):

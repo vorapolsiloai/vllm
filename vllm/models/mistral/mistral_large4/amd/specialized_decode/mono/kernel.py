@@ -496,6 +496,10 @@ def build_ml4_monokernel(
     # One scoring task a verify block (``RB`` in the fused indexer) instead of
     # one a row; ``MONO_INDEX_QBLOCK=0`` restores a task a row (bit-identical).
     INDEX_QBLOCK = os.environ.get("MONO_INDEX_QBLOCK", "1") == "1"
+    # The local selector's radix digits count each thread's keys from registers
+    # (read from LDS once) instead of re-reading LDS a digit;
+    # ``MONO_SEL_REG_KEYS=0`` restores the LDS reads (bit-identical).
+    SEL_REG_KEYS = os.environ.get("MONO_SEL_REG_KEYS", "1") == "1"
     QHEADS = (
         WAVES
         if (
@@ -3793,6 +3797,24 @@ def build_ml4_monokernel(
                                                     i, value[0], ordered=level > 0
                                                 )
                                 gpu.barrier()
+                                # Each thread's keys (thread-major, as the compaction
+                                # ranks them) read once: the three remaining digits
+                                # count them from registers, where a digit's LDS read
+                                # waited behind the previous key's histogram add.  Any
+                                # split of the keys gives the same counts.  Not the CP
+                                # build's, which stays as it was.
+                                REG_KEYS = SEL_REG_KEYS and not indexer_cp
+                                items = SEL_ITEMS
+                                if const_expr(REG_KEYS):
+                                    item_indices = [
+                                        tid * items + d for d in range_constexpr(items)
+                                    ]
+                                    item_bits = [
+                                        lds_ld(
+                                            xs, sel_slot(fx.min(i, n_in - 1))
+                                        ).bitcast(fx.Int32)
+                                        for i in item_indices
+                                    ]
                                 prefix, remain = select_digit(
                                     24, fx.Uint32(0), fx.min(fx.Int32(topk), n_in)
                                 )
@@ -3802,13 +3824,19 @@ def build_ml4_monokernel(
                                         lds_st(keys, tid, fx.Int32(0))
                                     gpu.barrier()
                                     for batch in range_constexpr(SEL_ITEMS):
-                                        i = tid + batch * THREADS
+                                        if const_expr(REG_KEYS):
+                                            i = item_indices[batch]
+                                        else:
+                                            i = tid + batch * THREADS
                                         if i < n_in:
-                                            key = fx.Uint32(
-                                                lds_ld(xs, sel_slot(i)).bitcast(
-                                                    fx.Int32
+                                            if const_expr(REG_KEYS):
+                                                key = fx.Uint32(item_bits[batch])
+                                            else:
+                                                key = fx.Uint32(
+                                                    lds_ld(xs, sel_slot(i)).bitcast(
+                                                        fx.Int32
+                                                    )
                                                 )
-                                            )
                                             if (key & fx.Uint32(prefix_mask)) == prefix:
                                                 digit = fx.Int32(
                                                     (key >> shift) & fx.Uint32(255)
@@ -3824,16 +3852,16 @@ def build_ml4_monokernel(
 
                                 threshold = prefix
                                 r_index_out = _rsrc(mb("indices"))
-                                items = SEL_ITEMS
-                                item_indices = [
-                                    tid * items + d for d in range_constexpr(items)
-                                ]
-                                item_bits = [
-                                    lds_ld(xs, sel_slot(fx.min(i, n_in - 1))).bitcast(
-                                        fx.Int32
-                                    )
-                                    for i in item_indices
-                                ]
+                                if const_expr(not REG_KEYS):
+                                    item_indices = [
+                                        tid * items + d for d in range_constexpr(items)
+                                    ]
+                                    item_bits = [
+                                        lds_ld(
+                                            xs, sel_slot(fx.min(i, n_in - 1))
+                                        ).bitcast(fx.Int32)
+                                        for i in item_indices
+                                    ]
                                 item_keys = [fx.Uint32(b) for b in item_bits]
                                 gt = [
                                     (i < n_in) & (key > threshold)

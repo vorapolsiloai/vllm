@@ -510,6 +510,11 @@ def build_ml4_monokernel(
     # query; ``MONO_SCORE_EARLY=0`` restores one tile's chain after another
     # (bit-identical: the same loads, issued earlier).
     SCORE_EARLY = os.environ.get("MONO_SCORE_EARLY", "1") == "1"
+    # A verify block's scoring task reads each row's query fragments and head
+    # weights from LDS once a pass and issues all of a tile's row MFMAs before
+    # their epilogues; ``MONO_SCORE_QREG=0`` restores the per-row reads and
+    # chains (bit-identical: the same operations per row, in the same order).
+    SCORE_QREG = os.environ.get("MONO_SCORE_QREG", "1") == "1"
     QHEADS = (
         WAVES
         if (
@@ -3152,6 +3157,31 @@ def build_ml4_monokernel(
                     head = head_group * 16 + lane % 16
                     if const_expr(not EARLY):
                         tiles = issue_tile_loads(key_group)
+                    # A verify block's rows: their query fragments and head weights
+                    # are read once a pass and every tile reuses them from registers,
+                    # instead of each row of each tile waiting on its own LDS reads.
+                    QREG = SCORE_QREG and RB > 1
+                    if const_expr(QREG):
+                        row_q = [
+                            [
+                                load_index_q8(head, k32 * 32 + (lane // 16) * 8, r)
+                                for k32 in range_constexpr(INDEX_DIM // 32)
+                            ]
+                            for r in range_constexpr(RB)
+                        ]
+                        row_w = [
+                            [
+                                lds_ld(
+                                    keys,
+                                    head_group * 16
+                                    + (lane // 16) * 4
+                                    + e
+                                    + r * INDEX_HEADS,
+                                ).bitcast(fx.Float32)
+                                for e in range_constexpr(4)
+                            ]
+                            for r in range_constexpr(RB)
+                        ]
 
                     def score_tile(u):
                         local_key, key_pos, safe_key, kv_scale, words = tiles[u]
@@ -3174,6 +3204,46 @@ def build_ml4_monokernel(
                                 for k32 in range(INDEX_DIM // 32)
                             ]
                         kvs = (kv0, kv1, kv2, kv3)
+                        if const_expr(QREG):
+                            # Every row's MFMAs, then the epilogues, then the
+                            # stores: the rows' accumulation chains are
+                            # independent, and a masked store between two rows
+                            # would end the block the scheduler overlaps them in.
+                            frags = []
+                            for r in range_constexpr(RB):
+                                score_frag = fx.Vector.filled(4, 0.0, fx.Float32)
+                                for k32 in range_constexpr(INDEX_DIM // 32):
+                                    score_frag = fx.Vector(
+                                        rocdl.mfma_f32_16x16x32_bf16(
+                                            T.vec(4, T.f32),
+                                            [row_q[r][k32], kvs[k32], score_frag],
+                                        )
+                                    )
+                                frags.append(score_frag)
+                            partials = []
+                            for r in range_constexpr(RB):
+                                partial = fx.Float32(0.0)
+                                for e in range_constexpr(4):
+                                    partial = (
+                                        partial
+                                        + fx.max(frags[r][e], fx.Float32(0.0))
+                                        * row_w[r][e]
+                                    )
+                                if const_expr(index_fp8):
+                                    partial = partial * (
+                                        safe_key >= first_position
+                                    ).select(fx.Float32(1.0), kv_scale)
+                                partial = _xred(partial, 16, lambda a, b: a + b)
+                                partial = _xred(partial, 32, lambda a, b: a + b)
+                                partials.append(partial)
+                            if lane < 16:
+                                for r in range_constexpr(RB):
+                                    lds_st(
+                                        red,
+                                        (u * RB + r) * 128 + wave * 16 + lane,
+                                        partials[r],
+                                    )
+                            return
                         for r in range_constexpr(RB):
                             score_frag = fx.Vector.filled(4, 0.0, fx.Float32)
                             for k32 in range_constexpr(INDEX_DIM // 32):

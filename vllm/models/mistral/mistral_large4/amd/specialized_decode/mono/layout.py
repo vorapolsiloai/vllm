@@ -210,6 +210,26 @@ def index_levels(index_max_seq: int, topk: int) -> int:
     return level
 
 
+def index_select_spread(index_max_seq: int, indexer_cp: bool, topk: int) -> bool:
+    """Do a row's leaves select together instead of feeding a merge tree?
+
+    One level across the leaf CTAs: each leaf exchanges its radix digits'
+    histograms and its winner counts with the row's other leaves and writes its
+    own winners at their global positions in `indices`.  A local build with
+    more than one leaf; `MONO_SEL_DIST=0` keeps the tree (bit-identical).
+    """
+    if indexer_cp or os.environ.get("MONO_SEL_DIST", "1") != "1":
+        return False
+    return index_lists(index_select_capacity(index_max_seq, indexer_cp), 0, topk) > 1
+
+
+def index_select_depth(index_max_seq: int, indexer_cp: bool, topk: int) -> int:
+    """Merge levels above the leaves: none when the leaves select together."""
+    if index_select_spread(index_max_seq, indexer_cp, topk):
+        return 0
+    return index_levels(index_select_capacity(index_max_seq, indexer_cp), topk)
+
+
 def index_select_stage(level: int, depth: int) -> str:
     """Stage name of tree `level`; the final level keeps `index_select`."""
     return "index_select" if level == depth else f"index_sel{level}"
@@ -387,6 +407,17 @@ def layout(
     tiled_indexer = with_indexer and indexer_uses_tiles(index_max_seq, indexer_cp)
     index_ranks = index_cp_world(npes, samples, index_max_seq) if indexer_cp else 1
     pair_bytes = 8
+    spread = with_indexer and index_select_spread(
+        index_max_seq, indexer_cp, sparse_attention_topk
+    )
+    # Ready tags a row: one a leaf when the leaves select together.
+    ready_slots = (
+        index_lists(
+            index_select_capacity(index_max_seq, indexer_cp), 0, sparse_attention_topk
+        )
+        if spread
+        else 1
+    )
     items = [
         ("q_a", samples * Q_LORA * pair_bytes),
         ("q_an", samples * HIDDEN // 2 * pair_bytes),
@@ -429,7 +460,7 @@ def layout(
                 * pair_bytes,
             ),
             ("indices", samples * sparse_attention_topk * 4),
-            ("indices_ready", samples * pair_bytes),
+            ("indices_ready", samples * ready_slots * pair_bytes),
         ]
         # One region a NON-final selection-tree level: its lists' (score, key
         # index) entries, two tagged pairs each, so one 16-byte store publishes
@@ -437,7 +468,9 @@ def layout(
         # ``indices`` instead, so a build of ``index_levels`` = 0 (every context
         # one leaf can serve, and every tiled build) adds nothing at all.
         select_capacity = index_select_capacity(index_max_seq, indexer_cp)
-        for level in range(index_levels(select_capacity, sparse_attention_topk)):
+        for level in range(
+            index_select_depth(index_max_seq, indexer_cp, sparse_attention_topk)
+        ):
             items += [
                 (
                     f"isel{level}",
@@ -447,6 +480,20 @@ def layout(
                     * 2
                     * pair_bytes,
                 )
+            ]
+        if spread:
+            # Leaves selecting together: each leaf's histogram a radix digit, and
+            # its (strictly greater, tied) winner counts.
+            items += [
+                (
+                    "isel_hist",
+                    samples
+                    * ready_slots
+                    * INDEX_RADIX_DIGITS
+                    * INDEX_RADIX_BINS
+                    * pair_bytes,
+                ),
+                ("isel_count", samples * ready_slots * 2 * pair_bytes),
             ]
         if tiled_indexer:
             parts = index_cp_partitions(index_max_seq, index_ranks)
@@ -584,7 +631,7 @@ def stage_tasks(
         # keep the name they had when the tree was a single flat select.  A
         # tiled build is depth 0, so its table is unchanged.
         select_capacity = index_select_capacity(index_max_seq, indexer_cp)
-        depth = index_levels(select_capacity, sparse_attention_topk)
+        depth = index_select_depth(index_max_seq, indexer_cp, sparse_attention_topk)
         tasks += [
             (
                 index_select_stage(level, depth),

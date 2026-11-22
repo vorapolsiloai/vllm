@@ -399,6 +399,36 @@ def test_index_verify_block_one_key_load(n, monkeypatch):
         assert torch.equal(picked[s].sort().values, ref_picked[s].sort().values), s
 
 
+@pytest.mark.parametrize("n", (131072, 40000, 3000))
+@torch.inference_mode()
+def test_index_select_across_leaves(n, monkeypatch):
+    """A row's leaves selecting together (MONO_SEL_DIST, no merge level) pick
+    the merge tree's keys in the tree's order. The block table repeats 37
+    physical pages, so every score recurs on every leaf and the threshold's
+    ties split across leaves; this launch's own keys go to an unshared page."""
+    ctx = torch.arange(n - S + 1, n + 1, device="cuda")
+    need = (n + PAGE - 1) // PAGE
+    torch.manual_seed(5)
+    pages = torch.randperm(LONG_PAGES, device="cuda", dtype=torch.int32)
+    tables = torch.zeros(S, LONG_PAGES, dtype=torch.int32, device="cuda")
+    tables[:, : need - 1] = pages[torch.arange(need - 1, device="cuda") % 37]
+    tables[:, need - 1] = pages[37]
+    h = _randn(S, HIDDEN).to(torch.bfloat16)
+    got = {}
+    for spread in ("1", "0"):
+        monkeypatch.setenv("MONO_SEL_DIST", spread)
+        with long_decode(S, width=S) as kernel:
+            got[spread] = index_step(kernel, h, ctx, tables)
+    (scores, _, picked), (ref, _, ref_picked) = got["1"], got["0"]
+    for s in range(S):
+        m = int(ctx[s])
+        assert torch.equal(scores[s, :m], ref[s, :m]), s
+        assert torch.equal(picked[s], ref_picked[s]), s
+        kth = scores[s, :m].topk(TOPK).values[-1]
+        tied_leaves = ((scores[s, :m] == kth).nonzero().flatten() // 16384).unique()
+        assert m <= 16384 or tied_leaves.numel() > 1, s
+
+
 CP = 4  # TP4: the context-parallel indexer's ranks
 
 

@@ -483,6 +483,10 @@ def build_ml4_monokernel(
     # in the up/gate stage, for an in-process A/B. Both are bit-identical; see
     # ``atom_mxfp4_scale_pair`` and the comment in ``ug8_units``.
     _UG_SCALE_PAIR = not _R2_OFF and os.environ.get("MONO_UG_SCALE_PAIR", "1") == "1"
+    # Entries one poll of the local selector's staging loop batches: one
+    # coherent round trip a batch instead of one an entry. ``MONO_SEL_POLL``
+    # overrides it for an A/B; every value is bit-identical.
+    SEL_POLL = int(os.environ.get("MONO_SEL_POLL", "8"))
     QHEADS = (
         WAVES
         if (
@@ -3599,11 +3603,13 @@ def build_ml4_monokernel(
                                     lds_st(keys, tid, fx.Int32(0))
                                 gpu.barrier()
 
-                                def stage_index_key(i, bits):
+                                def stage_index_key(i, bits, ordered=False):
                                     if i < n_in:
-                                        key = (bits >= 0).select(
-                                            bits ^ fx.Int32(-(2**31)), ~bits
-                                        )
+                                        key = bits
+                                        if const_expr(not ordered):
+                                            key = (bits >= 0).select(
+                                                bits ^ fx.Int32(-(2**31)), ~bits
+                                            )
                                         # The selector CTA no longer needs the large GEMV staging
                                         # region, so reuse it for the 4-K radix keys instead of
                                         # increasing the monokernel's LDS allocation.
@@ -3643,36 +3649,47 @@ def build_ml4_monokernel(
                                         for i, value in zip(ids, values):
                                             stage_index_key(i, value[0])
                                 else:
-                                    for batch in range_constexpr(SEL_ITEMS):
-                                        i = tid + batch * THREADS
-                                        # The source read is a tagged-pair POLL: it must stay
-                                        # INSIDE this guard.  A lane past ``n_in`` would spin
-                                        # forever on an entry its producer never wrote.
-                                        if i < n_in:
-                                            if const_expr(level == 0):
-                                                bits = getf(
-                                                    src, s * SCORE_STRIDE + j * SEG + i
-                                                ).bitcast(fx.Int32)
-                                                key = (bits >= 0).select(
-                                                    bits ^ fx.Int32(-(2**31)), ~bits
+                                    # The entries are tagged pairs other CTAs stored, so
+                                    # every read is a coherent round trip: poll SEL_POLL
+                                    # of them together, not one after another.  A batch
+                                    # wholly past ``n_in`` (uniform per task) is skipped;
+                                    # inside one, a lane past ``n_in`` polls the last
+                                    # entry, which is always written, and stages nothing --
+                                    # no poll may wait on a pair its producer never wrote.
+                                    def source_pair(i, j=j, s=s):
+                                        if const_expr(level == 0):
+                                            return s * SCORE_STRIDE + j * SEG + i
+                                        return entry_pair(i)
+
+                                    for batch in range_constexpr(
+                                        0, SEL_ITEMS, SEL_POLL
+                                    ):
+                                        if n_in > batch * THREADS:
+                                            ids = [
+                                                tid + b * THREADS
+                                                for b in range(
+                                                    batch,
+                                                    min(batch + SEL_POLL, SEL_ITEMS),
                                                 )
-                                            else:
-                                                # A list below the top already carries order keys.
-                                                key = get(src, entry_pair(i))
-                                            # The selector CTA no longer needs the large GEMV
-                                            # staging region, so reuse it for the 4-K radix keys
-                                            # instead of growing the monokernel's LDS allocation.
-                                            lds_st(
-                                                xs, sel_slot(i), key.bitcast(fx.Float32)
+                                            ]
+                                            values = poll(
+                                                [
+                                                    (
+                                                        src,
+                                                        source_pair(
+                                                            fx.min(i, n_in - 1)
+                                                        ),
+                                                        1,
+                                                    )
+                                                    for i in ids
+                                                ]
                                             )
-                                            digit = fx.Int32(
-                                                (fx.Uint32(key) >> 24) & fx.Uint32(255)
-                                            )
-                                            fx.atomic_add(
-                                                keys + digit,
-                                                fx.Int32(1),
-                                                syncscope="workgroup",
-                                            )
+                                            for i, value in zip(ids, values):
+                                                # A list below the top already carries
+                                                # order keys; only level 0 transforms.
+                                                stage_index_key(
+                                                    i, value[0], ordered=level > 0
+                                                )
                                 gpu.barrier()
                                 prefix, remain = select_digit(
                                     24, fx.Uint32(0), fx.min(fx.Int32(topk), n_in)

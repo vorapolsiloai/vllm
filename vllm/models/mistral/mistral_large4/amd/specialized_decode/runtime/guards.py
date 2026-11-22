@@ -16,6 +16,7 @@ INDEX_ROW = 132  # DSA indexer key row: 128 E4M3 bytes + one fp32 scale
 
 def model_refusals(model, config: DecodeConfig) -> list[str]:
     """After load: the layer mix, each kernel layer's weights, the device."""
+    from vllm.distributed import get_tensor_model_parallel_world_size
     from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.runtime.consensus import (  # noqa: E501
         MonoUnsupported,
     )
@@ -24,13 +25,14 @@ def model_refusals(model, config: DecodeConfig) -> list[str]:
 
     reasons: list[str] = []
     layers = list(model.layers)
+    tp_size = get_tensor_model_parallel_world_size()
     try:
         moe_kinds(layers)
     except MonoUnsupported as err:
         reasons.append(str(err))
     for layer in layers[1:]:
         try:
-            check_moe_layer(layer)
+            check_moe_layer(layer, tp_size)
         except (MonoUnsupported, AttributeError) as err:
             reasons.append(f"layer {layer.self_attn.spec.layer_idx}: {err}")
     # aux hidden-state taps (DSpark) are cloned off the residual stream between

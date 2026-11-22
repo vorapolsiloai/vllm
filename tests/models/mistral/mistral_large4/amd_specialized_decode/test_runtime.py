@@ -95,7 +95,7 @@ def test_switches():
 def test_refusal_lists_every_reason(monkeypatch):
     monkeypatch.setenv("VLLM_FP8_MOE_REQUANT_ACT", "a8w4")
     cfg = vllm_config(**{
-        "parallel_config.tensor_parallel_size": 8,
+        "parallel_config.tensor_parallel_size": 2,
         "cache_config.cache_dtype": "fp8_ds_mla",
         "speculative_config": object(),
     })  # fmt: skip
@@ -103,8 +103,8 @@ def test_refusal_lists_every_reason(monkeypatch):
         specialized_decode_config(cfg)
     msg = str(err.value)
     for part in (
-        "tensor parallel size 4", "bf16 or fp8 (e4m3) KV cache", "speculative decoding",
-        "a4w4",
+        "tensor parallel size 4 or 8", "bf16 or fp8 (e4m3) KV cache",
+        "speculative decoding", "a4w4",
     ):  # fmt: skip
         assert part in msg, msg
 
@@ -135,6 +135,8 @@ def test_widths_are_graph_capture_sizes():
 
 def test_supported_has_no_reasons():
     assert DECODE_CONFIG.refusal_reasons(vllm_config()) == []
+    tp8 = vllm_config(**{"parallel_config.tensor_parallel_size": 8})
+    assert DECODE_CONFIG.refusal_reasons(tp8) == []
     native = vllm_config(**{"model_config.quantization": "quark"})
     assert DECODE_CONFIG.refusal_reasons(native) == []  # experts checked after load
 

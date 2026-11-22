@@ -59,12 +59,14 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
 from vllm.models.mistral.mistral_large4.amd.specialized_decode.mono.common.device.ops import (
+    ballot,
     bpermute_i32,
     div_rn,
     f8_word,
     fp8_pack4,
     mem_realtime,
     memrealtime,
+    popcount,
     read_lane_i32,
     spin_pause,
     wave_umax_dpp,
@@ -487,6 +489,10 @@ def build_ml4_monokernel(
     # coherent round trip a batch instead of one an entry. ``MONO_SEL_POLL``
     # overrides it for an A/B; every value is bit-identical.
     SEL_POLL = int(os.environ.get("MONO_SEL_POLL", "8"))
+    # Rounds of whole-group adds in the local selector's top-byte histogram
+    # (``hist_add``); ``MONO_SEL_PEEL=0`` restores one atomic a lane. The
+    # counts are the same either way, so the selection is bit-identical.
+    SEL_PEEL = int(os.environ.get("MONO_SEL_PEEL", "1"))
     QHEADS = (
         WAVES
         if (
@@ -3603,6 +3609,48 @@ def build_ml4_monokernel(
                                     lds_st(keys, tid, fx.Int32(0))
                                 gpu.barrier()
 
+                                # Whole-group adds in the top-byte histogram (not the CP
+                                # build's, which stays as it was).
+                                PEEL = 0 if indexer_cp else SEL_PEEL
+
+                                def hist_add(digit):
+                                    """keys[digit] += 1 for every active lane.  The scores share
+                                    an exponent range, so their top bytes fall in a few bins (a
+                                    merge level's inputs, every list's top ``topk``, in one), and
+                                    same-address LDS atomics serialize lane by lane.  Each of
+                                    ``PEEL`` rounds takes the first pending lane's bin and adds
+                                    all of the wave's lanes in it with one atomic; the lanes left
+                                    add one by one."""
+                                    pending = fx.Boolean(True)
+                                    for _ in range_constexpr(PEEL):
+                                        pend = ballot(pending)
+                                        # The lowest pending lane (64 when none is left).
+                                        first = popcount(
+                                            (pend & (fx.Int64(0) - pend)) - 1
+                                        )
+                                        leader = read_lane_i32(digit, first)
+                                        group = ballot(pending & (digit == leader))
+                                        if lane == first:
+                                            fx.atomic_add(
+                                                keys + leader,
+                                                popcount(group),
+                                                syncscope="workgroup",
+                                            )
+                                        pending = pending & (digit != leader)
+                                    if const_expr(PEEL == 0):
+                                        fx.atomic_add(
+                                            keys + digit,
+                                            fx.Int32(1),
+                                            syncscope="workgroup",
+                                        )
+                                    else:
+                                        if pending:
+                                            fx.atomic_add(
+                                                keys + digit,
+                                                fx.Int32(1),
+                                                syncscope="workgroup",
+                                            )
+
                                 def stage_index_key(i, bits, ordered=False):
                                     if i < n_in:
                                         key = bits
@@ -3614,13 +3662,10 @@ def build_ml4_monokernel(
                                         # region, so reuse it for the 4-K radix keys instead of
                                         # increasing the monokernel's LDS allocation.
                                         lds_st(xs, sel_slot(i), key.bitcast(fx.Float32))
-                                        digit = fx.Int32(
-                                            (fx.Uint32(key) >> 24) & fx.Uint32(255)
-                                        )
-                                        fx.atomic_add(
-                                            keys + digit,
-                                            fx.Int32(1),
-                                            syncscope="workgroup",
+                                        hist_add(
+                                            fx.Int32(
+                                                (fx.Uint32(key) >> 24) & fx.Uint32(255)
+                                            )
                                         )
 
                                 if const_expr(indexer_cp):

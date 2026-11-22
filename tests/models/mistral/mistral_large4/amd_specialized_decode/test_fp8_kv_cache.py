@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU tests of the Mistral Large 4 specialized decode on an fp8 latent KV cache.
 
-One TP4 rank's shard of one MoE layer per kind runs on a single GPU through
-`Ml4MonoKernel` (npes=1), with random weights, a randomly paged cache and one
-DSpark verify step of 4 rows whose last row is padding (slot -1: KV-sharing
-layers used to load it ~4 GiB past the source cache, a GPU memory fault).
+One TP4 (or TP8) rank's shard of one MoE layer per kind runs on a single GPU
+through `Ml4MonoKernel` (npes=1), with random weights, a randomly paged cache
+and one DSpark verify step of 4 rows whose last row is padding (slot -1:
+KV-sharing layers used to load it ~4 GiB past the source cache, a GPU memory
+fault).
 
 The cache holds the same content as bf16 and as fp8 (written by vLLM's fp8
 cache writer, which fills it on every non-mono step). KV-sharing layers never
@@ -21,7 +22,7 @@ import torch
 from vllm.platforms import current_platform
 
 FP8 = torch.float8_e4m3fn
-HIDDEN, NH, KVL, PE, VD, E = 6144, 16, 512, 64, 128, 128
+HIDDEN, HEADS, KVL, PE, VD, E = 6144, 64, 512, 64, 128, 128
 QK = KVL + PE
 PAGE, PAGES, S, POS0, TOPK = 64, 64, 4, 3000, 2048
 
@@ -44,9 +45,10 @@ def _randn(*shape, scale=1.0):
 
 
 @functools.cache
-def build_layer(kind: str):
-    """(kernel variant, LayerWeights) of one random layer, packed as
-    `runtime.weights.build_moe_layer` packs a loaded one."""
+def build_layer(kind: str, tp: int = 4):
+    """(kernel variant, LayerWeights) of one random layer as TP rank 0 of
+    `tp` holds it, packed as `runtime.weights.build_moe_layer` packs a loaded
+    one."""
     from types import SimpleNamespace as NS
 
     from aiter.utility.fp4_utils import e8m0_shuffle
@@ -70,7 +72,8 @@ def build_layer(kind: str):
     q128 = weights._q128
     nope_layer, kv_share, _ = weights.KINDS[kind]
     v = load_variant(nope_layer, kv_share)
-    C = v.geometry_config.ml4_tp_config(4)
+    C = v.geometry_config.ml4_tp_config(tp)
+    NH = HEADS // tp
     bf, f32 = torch.bfloat16, torch.float32
     t = {}
     t["w_q_b"], t["s_q_b"] = q128(_randn(NH * 128, HIDDEN, scale=HIDDEN**-0.5))
@@ -168,8 +171,8 @@ def make_step():
     return base, index_cache, step
 
 
-def run_layer(kind, kv_cache_dtype, kv, index_cache, step, W=None):
-    v, W0 = build_layer(kind)
+def run_layer(kind, kv_cache_dtype, kv, index_cache, step, W=None, tp=4):
+    v, W0 = build_layer(kind, tp)
     kernel = v.op.Ml4MonoKernel(
         W or W0, S, rank=0, npes=1, group=None, topk=TOPK, launches_per_step=1,
         with_indexer=True, index_max_seq=PAGES * PAGE, index_request_width=S,
@@ -192,14 +195,14 @@ def run_layer(kind, kv_cache_dtype, kv, index_cache, step, W=None):
         kernel.close()
 
 
-def run_both(kind, history_scale=1, W=None):
+def run_both(kind, history_scale=1, W=None, tp=4):
     """The step on the same cache content as bf16 and as fp8:
     (out_bf16, out_fp8, cache_bf16, cache_fp8, cache content, written slots)."""
     base, index_cache, step = make_step()
     base = (base.float() * history_scale).to(FP8)  # power of two: exact
     kv_bf, kv_f8 = base.to(torch.bfloat16), base.clone()
-    out_bf = run_layer(kind, "bf16", kv_bf, index_cache, step, W)
-    out_f8 = run_layer(kind, "fp8", kv_f8, index_cache, step, W)
+    out_bf = run_layer(kind, "bf16", kv_bf, index_cache, step, W, tp)
+    out_f8 = run_layer(kind, "fp8", kv_f8, index_cache, step, W, tp)
     return out_bf, out_f8, kv_bf, kv_f8, base, step["slots"][:-1]
 
 
@@ -207,9 +210,12 @@ def run_both(kind, history_scale=1, W=None):
 # history_scale 4: the old rows dominate attention, so the new rows' fp8
 # rounding does not show and every kind matches bf16 exactly
 @pytest.mark.parametrize("history_scale", (1, 4))
+# TP8: 8 heads and 768 expert columns a rank, so the index-Q tiles run past
+# the q_b CTAs and the up/gate stage ends on a partial CTA round
+@pytest.mark.parametrize("tp", (4, 8))
 @torch.inference_mode()
-def test_fp8_cache_matches_bf16(kind, history_scale):
-    out_bf, out_f8, kv_bf, kv_f8, base, slots = run_both(kind, history_scale)
+def test_fp8_cache_matches_bf16(kind, history_scale, tp):
+    out_bf, out_f8, kv_bf, kv_f8, base, slots = run_both(kind, history_scale, tp=tp)
     written = torch.zeros(PAGES * PAGE, dtype=torch.bool, device="cuda")
     written[slots] = kind != "nope_kvs"  # KV-sharing layers never write
     u8 = torch.uint8

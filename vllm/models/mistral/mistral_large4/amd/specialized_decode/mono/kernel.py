@@ -500,6 +500,11 @@ def build_ml4_monokernel(
     # (read from LDS once) instead of re-reading LDS a digit;
     # ``MONO_SEL_REG_KEYS=0`` restores the LDS reads (bit-identical).
     SEL_REG_KEYS = os.environ.get("MONO_SEL_REG_KEYS", "1") == "1"
+    # A scoring pass issues its block-table reads together, then its key and
+    # scale loads, and the first pass issues them before it waits for the
+    # query; ``MONO_SCORE_EARLY=0`` restores one tile's chain after another
+    # (bit-identical: the same loads, issued earlier).
+    SCORE_EARLY = os.environ.get("MONO_SCORE_EARLY", "1") == "1"
     QHEADS = (
         WAVES
         if (
@@ -2975,6 +2980,7 @@ def build_ml4_monokernel(
             NG = S // RB  # task groups: a row each, or a request each
             QP = (INDEX_Q_ROWS // 2) // THREADS  # staged query pairs a thread a row
             STAGE_BELOW = G if G % NG == 0 else N_INDEX_SPLIT * NG
+            EARLY = SCORE_EARLY and index_fp8 and not indexer_cp
             for tt in range(start("index_score"), live_tiles * NG, G * SCORE_UNROLL):
                 tt = fx.Int32(tt)
                 s = tt % S if const_expr(RB == 1) else (tt % NG) * RB
@@ -2993,6 +2999,88 @@ def build_ml4_monokernel(
                 if const_expr(RB > 1):
                     shard_size = bound  # no CP: the shard is the whole context
                 if tile * INDEX_KEYS_PER_TASK < shard_size:
+
+                    def issue_tile_loads(key_group):
+                        """Every key load of the pass's tiles, issued before the first
+                        MFMA, so their memory round trips overlap instead of adding up.
+                        EARLY: the tiles' block-table reads first, then every key and
+                        scale load -- two round trips a pass, not a block-table read
+                        waiting behind the tile before it."""
+
+                        def tile_keys(u):
+                            local_key = (
+                                (tile + u * (G // NG)) * INDEX_KEYS_PER_TASK
+                                + key_group * 16
+                                + lane % 16
+                            )
+                            key_pos = shard_begin + local_key
+                            return local_key, key_pos, fx.min(key_pos, bound - 1)
+
+                        def tile_loads(local_key, key_pos, safe_key, cell=None):
+                            kv_scale = fx.Float32(1.0)
+                            if const_expr(index_fp8):
+                                if const_expr(cell is None):
+                                    cell = index_page_cell(s, safe_key)
+                                index_page, index_row = cell
+                                kv_scale = ld_f32(
+                                    r_index_cache,
+                                    index_fp8_scale_dword(
+                                        index_page, index_row, index_page_size
+                                    ),
+                                )
+                                # Eight preshuffled E4M3 bytes; the row's eight
+                                # columns k..k+7 share one 16-column tile, so they
+                                # are contiguous.
+                                words = [
+                                    fx.Vector(
+                                        bo.buffer_load(
+                                            r_index_cache,
+                                            index_fp8_data_dword(
+                                                index_page,
+                                                index_row,
+                                                k32 * 32 + (lane // 16) * 8,
+                                                index_page_size,
+                                            ),
+                                            vec_width=2,
+                                            dtype=T.i32,
+                                        )
+                                    )
+                                    for k32 in range(INDEX_DIM // 32)
+                                ]
+                            else:
+                                words = [
+                                    fx.Vector(
+                                        bo.buffer_load(
+                                            r_index_cache,
+                                            (
+                                                index_page_slot(s, safe_key) * INDEX_DIM
+                                                + k32 * 32
+                                                + (lane // 16) * 8
+                                            )
+                                            // 2,
+                                            vec_width=4,
+                                            dtype=T.i32,
+                                        )
+                                    )
+                                    for k32 in range(INDEX_DIM // 32)
+                                ]
+                            return local_key, key_pos, safe_key, kv_scale, words
+
+                        if const_expr(EARLY):
+                            keys_u = [tile_keys(u) for u in range(SCORE_UNROLL)]
+                            cells = [index_page_cell(s, k[2]) for k in keys_u]
+                            return [
+                                tile_loads(*k, cell=c) for k, c in zip(keys_u, cells)
+                            ]
+                        return [
+                            tile_loads(*tile_keys(u))
+                            for u in range_constexpr(SCORE_UNROLL)
+                        ]
+
+                    if const_expr(EARLY):
+                        # The keys do not depend on the query: the first pass's
+                        # loads land while it waits for index_q.
+                        tiles = issue_tile_loads(wave // 2)
                     # A CTA's tasks are t, t + G, ...: when NG divides G they all score
                     # one row (request), so its head weights and roped queries are
                     # staged at its first task.
@@ -3057,63 +3145,8 @@ def build_ml4_monokernel(
                     key_group = wave // 2
                     head_group = wave % 2
                     head = head_group * 16 + lane % 16
-                    # Every key load of the pass's tiles is issued before the first
-                    # MFMA, so their memory round trips overlap instead of adding up.
-                    tiles = []
-                    for u in range_constexpr(SCORE_UNROLL):
-                        local_key = (
-                            (tile + u * (G // NG)) * INDEX_KEYS_PER_TASK
-                            + key_group * 16
-                            + lane % 16
-                        )
-                        key_pos = shard_begin + local_key
-                        safe_key = fx.min(key_pos, bound - 1)
-                        kv_scale = fx.Float32(1.0)
-                        if const_expr(index_fp8):
-                            index_page, index_row = index_page_cell(s, safe_key)
-                            kv_scale = ld_f32(
-                                r_index_cache,
-                                index_fp8_scale_dword(
-                                    index_page, index_row, index_page_size
-                                ),
-                            )
-                            # Eight preshuffled E4M3 bytes; the row's eight
-                            # columns k..k+7 share one 16-column tile, so they
-                            # are contiguous.
-                            words = [
-                                fx.Vector(
-                                    bo.buffer_load(
-                                        r_index_cache,
-                                        index_fp8_data_dword(
-                                            index_page,
-                                            index_row,
-                                            k32 * 32 + (lane // 16) * 8,
-                                            index_page_size,
-                                        ),
-                                        vec_width=2,
-                                        dtype=T.i32,
-                                    )
-                                )
-                                for k32 in range(INDEX_DIM // 32)
-                            ]
-                        else:
-                            words = [
-                                fx.Vector(
-                                    bo.buffer_load(
-                                        r_index_cache,
-                                        (
-                                            index_page_slot(s, safe_key) * INDEX_DIM
-                                            + k32 * 32
-                                            + (lane // 16) * 8
-                                        )
-                                        // 2,
-                                        vec_width=4,
-                                        dtype=T.i32,
-                                    )
-                                )
-                                for k32 in range(INDEX_DIM // 32)
-                            ]
-                        tiles.append((local_key, key_pos, safe_key, kv_scale, words))
+                    if const_expr(not EARLY):
+                        tiles = issue_tile_loads(key_group)
 
                     def score_tile(u):
                         local_key, key_pos, safe_key, kv_scale, words = tiles[u]

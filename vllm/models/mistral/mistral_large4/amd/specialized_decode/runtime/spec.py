@@ -21,6 +21,11 @@ SPEC_METHODS = ("dspark",)
 @dataclass(frozen=True)
 class DecodeConfig:
     tp_sizes: tuple[int, ...] = (4, 8)  # 16 or 8 local heads
+    # TP sizes whose fused indexer splits each row's keys over the ranks
+    # (context-parallel scoring, distributed top-k). Over 8 ranks the
+    # top-k's chain of exchanges costs more than the scoring it splits,
+    # so at TP8 every rank scores and selects the whole context.
+    indexer_cp_tp_sizes: tuple[int, ...] = (4,)
     blocks: int = 256  # one CTA per CU, all co-resident
     # rows a launch serves (one decode token per request): vLLM's FULL-graph
     # capture sizes, so graph replays pad decode batches to them; eager steps

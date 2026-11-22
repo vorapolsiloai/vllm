@@ -405,11 +405,10 @@ def build_ml4_monokernel(
     N_SPLIT = topk // SPLIT_KEYS
     QB_ROWS = H * (NOPE_DIM + Q_PE_DIM)
     N_QB = QB_ROWS // Q_B_TILE
-    # The index-Q row space is fixed at 256 tiles.  TP8 produces half from
-    # q_b CTAs; TP4 produces all of them, one per CTA.
-    assert not with_indexer or (
-        INDEX_Q_ROWS // INDEX_TILE == BLOCKS and N_QB in (BLOCKS // 2, BLOCKS)
-    )
+    # The index-Q row space is fixed at 256 tiles, one per CTA: the q_b CTAs
+    # produce the first N_QB (TP4: half of them, TP8: a quarter), the CTAs
+    # after them the rest.
+    assert not with_indexer or (INDEX_Q_ROWS // INDEX_TILE == BLOCKS and N_QB <= BLOCKS)
     QB_PER_HEAD = (NOPE_DIM + Q_PE_DIM) // Q_B_TILE
     N_UK = H * KV_LORA // UK_TILE
     UK_PER_HEAD = KV_LORA // UK_TILE
@@ -621,8 +620,8 @@ def build_ml4_monokernel(
         base[name] = acc % G
         acc += tasks[name]
     if with_indexer:
-        # TP8 has index-Q tiles beyond q_b's row space.  TP4 produces the full
-        # index-Q row space alongside its q_b tile on every CTA.
+        # The index-Q tiles beyond q_b's row space go to the CTAs after the q_b
+        # CTAs (128 at TP4, 192 at TP8).
         base["index_q"] = (base["q_b"] + N_QB) % G
         base["index_score"] = 101
         # Every tree level rotates off the same CTA the single flat select used.
@@ -4892,12 +4891,13 @@ def build_ml4_monokernel(
             # Same number of rounds either way: ``2 * S`` (sample) rounds become
             # ``2 * S`` (group) rounds, of which only ``ug_n`` carry work.
             # Per-sample schedule: TOP_K * UG_C tasks (top-8: == inter; ug_task_rounds assumed that).
+            # They need not fill whole CTA rounds: TP8's 384 leave the last
+            # round to the first UG_TASKS % G CTAs of the rotation.
             UG_TASKS = TOP_K * UG_C
-            assert moe_dedup or UG_TASKS % G == 0, (
-                "the per-sample up/gate schedule needs whole CTA rounds"
-            )
-            UG_ROUNDS = UG_ROUTED * UG_C // G if moe_dedup else UG_TASKS // G
-            for task_round in range_constexpr(UG_ROUNDS):
+            UG_ROUNDS = UG_ROUTED * UG_C // G if moe_dedup else (UG_TASKS + G - 1) // G
+            ug_carry: dict[str, list] = {}
+
+            def ug_round(task_round):
                 u = fx.Int32(u0 + task_round * G)
                 c = u % UG_C
                 has_sh = u < UG_C
@@ -5104,10 +5104,10 @@ def build_ml4_monokernel(
                             _uniform(lds_ld(grp, GRP_EXP + group)), None, live
                         )
                     else:
-                        cur = ug_ahead  # type: ignore[has-type]  # noqa: F821  (bound by the previous unrolled round)
+                        cur = ug_carry.pop("ahead")  # issued by the previous round
                     if const_expr(task_round + 1 < UG_ROUNDS):
                         ahead = group + G // UG_C
-                        ug_ahead = ug8_units(  # noqa: F841
+                        ug_carry["ahead"] = ug8_units(
                             _uniform(lds_ld(grp, GRP_EXP + ahead)), None, ahead < ug_n
                         )
                 else:
@@ -5204,6 +5204,14 @@ def build_ml4_monokernel(
                         stamp("ug", sample * expert_inter + u, 4)  # mid mailbox write
                 if const_expr(task_round + 1 < UG_ROUNDS):
                     gpu.barrier()
+
+            for task_round in range_constexpr(UG_ROUNDS):
+                if const_expr(moe_dedup or (task_round + 1) * G <= UG_TASKS):
+                    ug_round(task_round)
+                else:
+                    # CTA-uniform: the round's barriers stay matched
+                    if fx.Int32(u0 + task_round * G) < UG_TASKS:
+                        ug_round(task_round)
 
         # ======== 10. mid FP8 quant + expert down + route weighting + MoE TP reduce
         # 2 row groups x (sample tile * 9 slots * 4) chunks: 4 waves per group.

@@ -20,7 +20,7 @@ SPEC_METHODS = ("dspark",)
 
 @dataclass(frozen=True)
 class DecodeConfig:
-    tp_size: int = 4  # the fused indexer's q_b split needs 16 local heads
+    tp_sizes: tuple[int, ...] = (4, 8)  # 16 or 8 local heads
     blocks: int = 256  # one CTA per CU, all co-resident
     # rows a launch serves (one decode token per request): vLLM's FULL-graph
     # capture sizes, so graph replays pad decode batches to them; eager steps
@@ -38,8 +38,11 @@ class DecodeConfig:
         pc = config.parallel_config
         cc = config.cache_config
         reasons: list[str] = []
-        if pc.tensor_parallel_size != self.tp_size:
-            reasons.append(f"requires tensor parallel size {self.tp_size}")
+        if pc.tensor_parallel_size not in self.tp_sizes:
+            reasons.append(
+                "requires tensor parallel size "
+                + " or ".join(str(tp) for tp in self.tp_sizes)
+            )
         if pc.pipeline_parallel_size != 1:
             reasons.append("does not support pipeline parallelism")
         if pc.data_parallel_size != 1:

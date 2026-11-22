@@ -173,6 +173,7 @@ class MonoRunner:
         every TP rank calls it on the same step, outside graph capture)."""
         assert not self.bound
         npes, heads, cfg = self.npes, self.heads, self.config
+        indexer_cp = npes in cfg.indexer_cp_tp_sizes
         kv_cache_dtype = self._kv_cache_dtype()
         unit = math.lcm(64, page)
         index_max_seq = block_table_stride * page // unit * unit
@@ -203,11 +204,12 @@ class MonoRunner:
                 # context-parallel indexer: each rank of the group scores a
                 # slice of every row's keys and the peers select the exact
                 # global top-k
+                cp = with_indexer and indexer_cp
                 scr, sym_l = v.layout.layout(
                     rows, heads, npes, cfg.topk, with_indexer, index_max_seq,
-                    inter=inter, native_fp4_mfma=True, indexer_cp=with_indexer,
+                    inter=inter, native_fp4_mfma=True, indexer_cp=cp,
                 )  # fmt: skip
-                builds.append((rows, kind, v, inter, with_indexer))
+                builds.append((rows, kind, v, inter, with_indexer, cp))
                 key = (nope, kvs)
                 scratch_bytes[key] = max(scratch_bytes.get(key, 0), scr["_bytes"])
                 if kind == LayerKind.ROPE:
@@ -226,11 +228,11 @@ class MonoRunner:
                 inter=inter,
                 output_heads=heads,
                 with_indexer=with_indexer,
-                indexer_cp=with_indexer,
+                indexer_cp=cp,
                 shared_indices=kind == LayerKind.ROPE_SHARED,
                 fault_offset=fault_offset,
             )  # fmt: skip
-            for rows, kind, v, inter, with_indexer in builds
+            for rows, kind, v, inter, with_indexer, cp in builds
         }
         dev = self.cos.device
         # one rank-local scratch per kernel package (sized for the widest

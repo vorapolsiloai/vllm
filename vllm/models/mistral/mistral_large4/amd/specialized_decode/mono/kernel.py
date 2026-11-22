@@ -493,6 +493,9 @@ def build_ml4_monokernel(
     # (``hist_add``); ``MONO_SEL_PEEL=0`` restores one atomic a lane. The
     # counts are the same either way, so the selection is bit-identical.
     SEL_PEEL = int(os.environ.get("MONO_SEL_PEEL", "1"))
+    # One scoring task a verify block (``RB`` in the fused indexer) instead of
+    # one a row; ``MONO_INDEX_QBLOCK=0`` restores a task a row (bit-identical).
+    INDEX_QBLOCK = os.environ.get("MONO_INDEX_QBLOCK", "1") == "1"
     QHEADS = (
         WAVES
         if (
@@ -2922,9 +2925,14 @@ def build_ml4_monokernel(
                     values += list(pair)
                 return fx.Vector.from_elements(values, fx.Float32).to(fx.BFloat16)
 
-            def load_index_q8(head, k):
+            def load_index_q8(head, k, row=0):
+                """Query elements k..k+7 of one head; `row` = which of the task's
+                staged rows (each `INDEX_Q_ROWS // 2` words)."""
+                base = (head * INDEX_DIM + k) // 2
+                if const_expr(row):
+                    base = base + row * (INDEX_Q_ROWS // 2)
                 words = fx.Vector.from_elements(
-                    [lds_ld(xs, (head * INDEX_DIM + k) // 2 + j) for j in range(4)],
+                    [lds_ld(xs, base + j) for j in range(4)],
                     fx.Float32,
                 )
                 return words.bitcast(fx.BFloat16)
@@ -2942,38 +2950,64 @@ def build_ml4_monokernel(
                     // INDEX_KEYS_PER_TASK,
                 )
             live_tiles = fx.min(live_tiles, fx.Int32(N_INDEX_SPLIT))
-            STAGE_BELOW = G if G % S == 0 else N_INDEX_SPLIT * S
             # Tiles a pass of the loop below (tasks tt, tt + G, ...: one row when S
             # divides G). One with the context-parallel indexer, whose exchange
             # reuses the reduction words a second tile would take.
             SCORE_UNROLL = 1 if indexer_cp or G % S else 4
-            for tt in range(start("index_score"), live_tiles * S, G * SCORE_UNROLL):
+            # Rows a task scores.  The rows of one request (a speculative verify
+            # block) read the same keys, so the local indexer scores all of them
+            # from one key load: a context costs live_tiles tasks, not live_tiles
+            # x S (a 4-row block at 128k: 2 passes a CTA instead of 8).  Each row
+            # keeps its MFMAs, weights and reduction order, so the scores are
+            # bit-identical.
+            RB = (
+                index_request_width
+                if INDEX_QBLOCK
+                and not indexer_cp
+                and index_request_width == S  # one verify block a launch
+                and SCORE_UNROLL * index_request_width * 128 <= RED_WORDS
+                else 1
+            )
+            NG = S // RB  # task groups: a row each, or a request each
+            QP = (INDEX_Q_ROWS // 2) // THREADS  # staged query pairs a thread a row
+            STAGE_BELOW = G if G % NG == 0 else N_INDEX_SPLIT * NG
+            for tt in range(start("index_score"), live_tiles * NG, G * SCORE_UNROLL):
                 tt = fx.Int32(tt)
-                s = tt % S
-                tile = tt // S
+                s = tt % S if const_expr(RB == 1) else (tt % NG) * RB
+                tile = tt // NG
                 stamp("index_score", tt, 0)
                 bound = row_position(s) + 1
+                # The task's rows (s, s + 1, ...: one request) and their bounds;
+                # keys load up to the last row's.
+                rows = [s] + [s + r for r in range(1, RB)]
+                bounds = [bound] + [row_position(row) + 1 for row in rows[1:]]
+                for row_bound in bounds[1:]:
+                    bound = fx.max(bound, row_bound)
                 request_start = index_request_start(s)
                 first_position = row_position(request_start)
                 shard_begin, shard_size = index_shard(s)
+                if const_expr(RB > 1):
+                    shard_size = bound  # no CP: the shard is the whole context
                 if tile * INDEX_KEYS_PER_TASK < shard_size:
-                    # A CTA's tasks are t, t + G, ...: when S divides G they all score one
-                    # row, so its head weights and roped query are staged at its first task.
+                    # A CTA's tasks are t, t + G, ...: when NG divides G they all score
+                    # one row (request), so its head weights and roped queries are
+                    # staged at its first task.
                     if tt < STAGE_BELOW:
-                        get(mb("index_ready"), s)
-                        if tid < INDEX_HEADS:
+                        poll([(mb("index_ready"), row, 1) for row in rows])
+                        if tid < RB * INDEX_HEADS:
                             lds_st(keys, tid, get(mb("index_w"), s * INDEX_HEADS + tid))
                         # Every key group reuses the same 32x128 query.  Stage and RoPE
                         # it once per scoring CTA instead of polling and rotating it in
                         # each of the four key-group wave pairs.
                         # Peer reads benefit from independent outstanding polls.
-                        # Keep the original one-pair staging order when CP is off.
-                        q_batch = (INDEX_Q_ROWS // 2) // THREADS if indexer_cp else 1
-                        for batch in range_constexpr(
-                            0, (INDEX_Q_ROWS // 2) // THREADS, q_batch
-                        ):
-                            q_pairs = [
-                                tid + (batch + b) * THREADS for b in range(q_batch)
+                        # Keep the original one-pair staging order when CP is off
+                        # and a task scores one row.
+                        q_batch = RB * QP if indexer_cp or RB > 1 else 1
+                        for batch in range_constexpr(0, RB * QP, q_batch):
+                            # (row of the task, pair of the row) a poll
+                            q_items = [
+                                ((batch + b) // QP, tid + ((batch + b) % QP) * THREADS)
+                                for b in range(q_batch)
                             ]
                             q_source = (
                                 cp_buffer("index_cp_q", sym)
@@ -2982,17 +3016,17 @@ def build_ml4_monokernel(
                             )
                             q_words = poll(
                                 [
-                                    (q_source, s * INDEX_Q_ROWS // 2 + pair, 1)
-                                    for pair in q_pairs
+                                    (q_source, rows[r] * INDEX_Q_ROWS // 2 + pair, 1)
+                                    for r, pair in q_items
                                 ],
                                 scope="system" if SHARD_INDEX_Q else "agent",
                             )
-                            for q_pair, q_word in zip(q_pairs, q_words):
+                            for (r, q_pair), q_word in zip(q_items, q_words):
                                 q_elem = q_pair * 2
                                 kq = q_elem % INDEX_DIM
                                 q0, q1 = bf2_f32(q_word[0])
                                 iss = ml4_ssmax(
-                                    row_position(s),
+                                    row_position(rows[r]),
                                     ML4_P_ISS_S,
                                     ML4_P_ISS_B,
                                     q_elem // INDEX_DIM,
@@ -3002,14 +3036,19 @@ def build_ml4_monokernel(
                                     if kq < PE_DIM:
                                         c = ld_rope(
                                             _rsrc(rope_cos),
-                                            row_position(s) * (PE_DIM // 2) + kq // 2,
+                                            row_position(rows[r]) * (PE_DIM // 2)
+                                            + kq // 2,
                                         )
                                         sn = ld_rope(
                                             _rsrc(rope_sin),
-                                            row_position(s) * (PE_DIM // 2) + kq // 2,
+                                            row_position(rows[r]) * (PE_DIM // 2)
+                                            + kq // 2,
                                         )
                                         q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
-                                lds_st(xs, q_pair, bf16_pair(q0, q1))
+                                q_slot = (
+                                    q_pair if r == 0 else r * (QP * THREADS) + q_pair
+                                )
+                                lds_st(xs, q_slot, bf16_pair(q0, q1))
                     gpu.barrier()
                     key_group = wave // 2
                     head_group = wave % 2
@@ -3019,7 +3058,7 @@ def build_ml4_monokernel(
                     tiles = []
                     for u in range_constexpr(SCORE_UNROLL):
                         local_key = (
-                            (tile + u * (G // S)) * INDEX_KEYS_PER_TASK
+                            (tile + u * (G // NG)) * INDEX_KEYS_PER_TASK
                             + key_group * 16
                             + lane % 16
                         )
@@ -3071,7 +3110,8 @@ def build_ml4_monokernel(
                                 for k32 in range(INDEX_DIM // 32)
                             ]
                         tiles.append((local_key, key_pos, safe_key, kv_scale, words))
-                    for u in range_constexpr(SCORE_UNROLL):
+
+                    def score_tile(u):
                         local_key, key_pos, safe_key, kv_scale, words = tiles[u]
                         if const_expr(index_fp8):
                             # E4M3 -> bf16 is exact, and the row scale multiplies
@@ -3092,56 +3132,73 @@ def build_ml4_monokernel(
                                 for k32 in range(INDEX_DIM // 32)
                             ]
                         kvs = (kv0, kv1, kv2, kv3)
-                        score_frag = fx.Vector.filled(4, 0.0, fx.Float32)
-                        for k32 in range_constexpr(INDEX_DIM // 32):
-                            qv = load_index_q8(head, k32 * 32 + (lane // 16) * 8)
-                            score_frag = fx.Vector(
-                                rocdl.mfma_f32_16x16x32_bf16(
-                                    T.vec(4, T.f32), [qv, kvs[k32], score_frag]
+                        for r in range_constexpr(RB):
+                            score_frag = fx.Vector.filled(4, 0.0, fx.Float32)
+                            for k32 in range_constexpr(INDEX_DIM // 32):
+                                qv = load_index_q8(head, k32 * 32 + (lane // 16) * 8, r)
+                                score_frag = fx.Vector(
+                                    rocdl.mfma_f32_16x16x32_bf16(
+                                        T.vec(4, T.f32), [qv, kvs[k32], score_frag]
+                                    )
                                 )
-                            )
-                        partial = fx.Float32(0.0)
-                        for e in range_constexpr(4):
-                            index_head = head_group * 16 + (lane // 16) * 4 + e
-                            weight = lds_ld(keys, index_head).bitcast(fx.Float32)
-                            partial = (
-                                partial
-                                + fx.max(score_frag[e], fx.Float32(0.0)) * weight
-                            )
-                        if const_expr(index_fp8):
-                            # Rows this launch wrote came from the mailbox already
-                            # dequantized; only cache reads carry a scale.  The key
-                            # is lane % 16, which the two reductions below preserve,
-                            # so one factor per lane is correct either side of them.
-                            partial = partial * (safe_key >= first_position).select(
-                                fx.Float32(1.0), kv_scale
-                            )
-                        partial = _xred(partial, 16, lambda a, b: a + b)
-                        partial = _xred(partial, 32, lambda a, b: a + b)
-                        if lane < 16:
-                            lds_st(red, u * 128 + wave * 16 + lane, partial)
+                            partial = fx.Float32(0.0)
+                            for e in range_constexpr(4):
+                                index_head = head_group * 16 + (lane // 16) * 4 + e
+                                if const_expr(r):
+                                    index_head = index_head + r * INDEX_HEADS
+                                weight = lds_ld(keys, index_head).bitcast(fx.Float32)
+                                partial = (
+                                    partial
+                                    + fx.max(score_frag[e], fx.Float32(0.0)) * weight
+                                )
+                            if const_expr(index_fp8):
+                                # Rows this launch wrote came from the mailbox
+                                # already dequantized; only cache reads carry a
+                                # scale.  The key is lane % 16, which the two
+                                # reductions below preserve, so one factor per lane
+                                # is correct either side of them.
+                                partial = partial * (safe_key >= first_position).select(
+                                    fx.Float32(1.0), kv_scale
+                                )
+                            partial = _xred(partial, 16, lambda a, b: a + b)
+                            partial = _xred(partial, 32, lambda a, b: a + b)
+                            if lane < 16:
+                                lds_st(
+                                    red, (u * RB + r) * 128 + wave * 16 + lane, partial
+                                )
+
+                    for u in range_constexpr(SCORE_UNROLL):
+                        if const_expr(RB == 1):
+                            score_tile(u)
+                        else:
+                            # A task's later tiles lie past a short context: skip
+                            # their MFMAs (their scores are never stored).
+                            if (tile + u * (G // NG)) * INDEX_KEYS_PER_TASK < bound:
+                                score_tile(u)
                     gpu.barrier()
                     for u in range_constexpr(SCORE_UNROLL):
                         local_key, key_pos = tiles[u][0], tiles[u][1]
-                        if (wave % 2 == 0) & (lane < 16) & (key_pos < bound):
-                            score = lds_ld(red, u * 128 + wave * 16 + lane) + lds_ld(
-                                red, u * 128 + (wave + 1) * 16 + lane
-                            )
-                            if const_expr(indexer_cp):
-                                if bound <= LOCAL_INDEX_CAPACITY:
-                                    lds_st(red, 128 + key_group * 16 + lane, score)
+                        for r in range_constexpr(RB):
+                            if (wave % 2 == 0) & (lane < 16) & (key_pos < bounds[r]):
+                                at = (u * RB + r) * 128
+                                score = lds_ld(red, at + wave * 16 + lane) + lds_ld(
+                                    red, at + (wave + 1) * 16 + lane
+                                )
+                                if const_expr(indexer_cp):
+                                    if bound <= LOCAL_INDEX_CAPACITY:
+                                        lds_st(red, 128 + key_group * 16 + lane, score)
+                                    else:
+                                        put(
+                                            mb("index_scores"),
+                                            s * INDEX_CAPACITY + local_key,
+                                            score,
+                                        )
                                 else:
                                     put(
                                         mb("index_scores"),
-                                        s * INDEX_CAPACITY + local_key,
+                                        rows[r] * INDEX_CAPACITY + local_key,
                                         score,
                                     )
-                            else:
-                                put(
-                                    mb("index_scores"),
-                                    s * INDEX_CAPACITY + local_key,
-                                    score,
-                                )
                     if const_expr(indexer_cp):
                         if bound <= LOCAL_INDEX_CAPACITY:
                             # One wave per peer, one complete score exchange.

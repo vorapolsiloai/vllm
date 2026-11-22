@@ -295,13 +295,14 @@ def long_caches():
     return base, index_cache.contiguous(), cos, sin
 
 
-def long_decode(rows, rank=0, npes=1, group=None, indexer_cp=False):
-    """Rope-layer kernel of `rows` plain decode rows over the long caches."""
+def long_decode(rows, rank=0, npes=1, group=None, indexer_cp=False, width=1):
+    """Rope-layer kernel of `rows` decode rows over the long caches, `width`
+    rows a request (1: plain decode, `rows`: one verify block)."""
     v, W = build_layer("rope")
     return v.op.Ml4MonoKernel(
         W, rows, rank=rank, npes=npes, group=group, topk=TOPK, launches_per_step=1,
         with_indexer=True, index_max_seq=LONG_PAGES * PAGE, indexer_cp=indexer_cp,
-        index_request_width=1,
+        index_request_width=width,
         index_page_size=PAGE, index_block_table_stride=LONG_PAGES,
         index_cache_dtype="fp8", attention_weight="fp8_block128",
         kv_cache_layout="atom", kv_cache_dtype="fp8",
@@ -366,6 +367,36 @@ def test_index_select_long_contexts():
             kth = own.topk(TOPK).values[-1]
             assert (own[picked[s]] >= kth).all(), s
             assert torch.isin((own > kth).nonzero().flatten(), picked[s]).all(), s
+
+
+@pytest.mark.parametrize("n", (131072, 40000, 3000))
+@torch.inference_mode()
+def test_index_verify_block_one_key_load(n, monkeypatch):
+    """One request's 4-row verify block (consecutive positions, one block
+    table), up to eight selector leaves: scoring all of the block's rows from
+    one key load gives every row the scores and picked keys of one task a row
+    (MONO_INDEX_QBLOCK=0), and no score past the row's own context."""
+    ctx = torch.arange(n - S + 1, n + 1, device="cuda")  # each row's keys
+    need = (n + PAGE - 1) // PAGE
+    torch.manual_seed(4)
+    pages = torch.randperm(LONG_PAGES, device="cuda", dtype=torch.int32)[:need]
+    tables = torch.zeros(S, LONG_PAGES, dtype=torch.int32, device="cuda")
+    tables[:, :need] = pages
+    h = _randn(S, HIDDEN).to(torch.bfloat16)
+    got = {}
+    for qblock in ("1", "0"):
+        monkeypatch.setenv("MONO_INDEX_QBLOCK", qblock)
+        with long_decode(S, width=S) as kernel:
+            got[qblock] = index_step(kernel, h, ctx, tables)
+    (scores, tags, picked), (ref, _, ref_picked) = got["1"], got["0"]
+    live = tags[0, 0].item()
+    assert live != 0
+    for s in range(S):
+        m = int(ctx[s])
+        assert (tags[s, :m] == live).all(), s
+        assert (tags[s, m:] == 0).all(), s
+        assert torch.equal(scores[s, :m], ref[s, :m]), s
+        assert torch.equal(picked[s].sort().values, ref_picked[s].sort().values), s
 
 
 CP = 4  # TP4: the context-parallel indexer's ranks

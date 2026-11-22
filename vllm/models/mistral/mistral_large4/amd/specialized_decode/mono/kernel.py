@@ -190,10 +190,11 @@ from .layout import (
     index_fan,
     index_fp8_data_dword,
     index_fp8_scale_dword,
-    index_levels,
     index_lists,
     index_seg,
     index_select_capacity,
+    index_select_depth,
+    index_select_spread,
     index_select_stage,
     indexer_uses_tiles,
     layout,
@@ -401,7 +402,11 @@ def build_ml4_monokernel(
         index_seg(index_max_seq) == LOCAL_INDEX_CAPACITY
     )  # the leaf IS the LDS staging
     INDEX_FAN = index_fan(index_max_seq, topk)
-    INDEX_DEPTH = index_levels(SELECT_CAPACITY, topk)
+    INDEX_DEPTH = index_select_depth(index_max_seq, indexer_cp, topk)
+    # A row's leaves select together (one level, no merge tree): ready tags,
+    # histograms and counts are kept a leaf, SEL_LEAVES a row.
+    SEL_SPREAD = with_indexer and index_select_spread(index_max_seq, indexer_cp, topk)
+    SEL_LEAVES = index_lists(SELECT_CAPACITY, 0, topk) if SEL_SPREAD else 1
     SHARD_INDEX_Q = indexer_cp and not TILED_INDEXER and W > 1
     CP_PARTS = index_cp_partitions(index_max_seq, CP_RANKS) if TILED_INDEXER else 0
     N_SPLIT = topk // SPLIT_KEYS
@@ -3643,6 +3648,117 @@ def build_ml4_monokernel(
                                     if const_expr(level == DEPTH)
                                     else tree_final(bound, level, SEG, FAN)
                                 )
+                                if const_expr(SEL_SPREAD):
+                                    # A row of more than one leaf selects across its
+                                    # leaves (no merge level): they exchange each
+                                    # digit's histogram and their winner counts, and
+                                    # each writes its own winners at their global
+                                    # positions -- the same set, ties and order as
+                                    # the tree's.
+                                    n_leaves = tree_lists(bound, 0, SEG, FAN)
+                                    spread = n_leaves > 1
+
+                                    def exchange_hist(di, s=s, j=j):
+                                        """keys[0:256] := the row's digit-``di`` histogram:
+                                        this leaf publishes its counts, then each bin sums
+                                        the row's leaves' (one batched poll a bin)."""
+                                        if spread:
+                                            if tid < INDEX_RADIX_BINS:
+
+                                                def slot(leaf):
+                                                    return (
+                                                        (s * SEL_LEAVES + leaf)
+                                                        * INDEX_RADIX_DIGITS
+                                                        + di
+                                                    ) * INDEX_RADIX_BINS + tid
+
+                                                put(
+                                                    mb("isel_hist"),
+                                                    slot(j),
+                                                    lds_ld(keys, tid),
+                                                )
+                                                counts = poll(
+                                                    [
+                                                        (
+                                                            mb("isel_hist"),
+                                                            slot(
+                                                                fx.min(
+                                                                    fx.Int32(leaf),
+                                                                    n_leaves - 1,
+                                                                )
+                                                            ),
+                                                            1,
+                                                        )
+                                                        for leaf in range(SEL_LEAVES)
+                                                    ],
+                                                    batch=SEL_LEAVES,
+                                                )
+                                                total = fx.Int32(0)
+                                                for leaf, c in enumerate(counts):
+                                                    total = total + (
+                                                        fx.Int32(leaf) < n_leaves
+                                                    ).select(c[0], fx.Int32(0))
+                                                lds_st(keys, tid, total)
+                                            gpu.barrier()
+
+                                    def exchange_counts(
+                                        out_gt, out_eq, target, need_eq, s=s, j=j
+                                    ):
+                                        """(strictly greater, tied) winners of the row's
+                                        leaves before this one, and the ties the row
+                                        still needs."""
+                                        gt_base = fx.Int32(0)
+                                        eq_base = fx.Int32(0)
+                                        if spread:
+                                            counts_lds = fx.recast_iter(fx.Int32, red)
+                                            if tid == 0:
+                                                base = (s * SEL_LEAVES + j) * 2
+                                                put(mb("isel_count"), base, out_gt)
+                                                put(mb("isel_count"), base + 1, out_eq)
+                                            if tid < SEL_LEAVES:
+                                                c = poll(
+                                                    [
+                                                        (
+                                                            mb("isel_count"),
+                                                            (
+                                                                s * SEL_LEAVES
+                                                                + fx.min(
+                                                                    tid, n_leaves - 1
+                                                                )
+                                                            )
+                                                            * 2,
+                                                            2,
+                                                        )
+                                                    ]
+                                                )[0]
+                                                live = tid < n_leaves
+                                                lds_st(
+                                                    counts_lds,
+                                                    tid,
+                                                    live.select(c[0], fx.Int32(0)),
+                                                )
+                                                lds_st(
+                                                    counts_lds,
+                                                    SEL_LEAVES + tid,
+                                                    live.select(c[1], fx.Int32(0)),
+                                                )
+                                            gpu.barrier()
+                                            total_gt = fx.Int32(0)
+                                            for leaf in range_constexpr(SEL_LEAVES):
+                                                g = lds_ld(counts_lds, leaf)
+                                                before = fx.Int32(leaf) < j
+                                                gt_base = gt_base + before.select(
+                                                    g, fx.Int32(0)
+                                                )
+                                                eq_base = eq_base + before.select(
+                                                    lds_ld(
+                                                        counts_lds, SEL_LEAVES + leaf
+                                                    ),
+                                                    fx.Int32(0),
+                                                )
+                                                total_gt = total_gt + g
+                                            need_eq = target - total_gt
+                                        return gt_base, eq_base, need_eq
 
                                 def entry_pair(i, j=j, s=s, BELOW=BELOW):
                                     """Pair index of merged value `i` in the level below."""
@@ -3848,11 +3964,15 @@ def build_ml4_monokernel(
                                         ).bitcast(fx.Int32)
                                         for i in item_indices
                                     ]
-                                prefix, remain = select_digit(
-                                    24, fx.Uint32(0), fx.min(fx.Int32(topk), n_in)
-                                )
+                                target = fx.min(fx.Int32(topk), n_in)
+                                if const_expr(SEL_SPREAD):
+                                    target = spread.select(
+                                        fx.min(fx.Int32(topk), bound), target
+                                    )
+                                    exchange_hist(0)
+                                prefix, remain = select_digit(24, fx.Uint32(0), target)
                                 prefix_mask = 255 << 24
-                                for shift in (16, 8, 0):
+                                for di, shift in enumerate((16, 8, 0), 1):
                                     if tid < 256:
                                         lds_st(keys, tid, fx.Int32(0))
                                     gpu.barrier()
@@ -3880,6 +4000,8 @@ def build_ml4_monokernel(
                                                     syncscope="workgroup",
                                                 )
                                     gpu.barrier()
+                                    if const_expr(SEL_SPREAD):
+                                        exchange_hist(di)
                                     prefix, remain = select_digit(shift, prefix, remain)
                                     prefix_mask |= 255 << shift
 
@@ -3983,9 +4105,13 @@ def build_ml4_monokernel(
 
                                 gt_offsets, out_gt = scan_flags(gt)
                                 gpu.barrier()
-                                eq_offsets, _ = scan_flags(eq)
+                                eq_offsets, out_eq = scan_flags(eq)
                                 gpu.barrier()
                                 need_eq = fx.min(fx.Int32(topk), n_in) - out_gt
+                                if const_expr(SEL_SPREAD):
+                                    gt_base, eq_base, need_eq = exchange_counts(
+                                        out_gt, out_eq, target, need_eq
+                                    )
                                 # ONE combined offset instead of a strict-greater block
                                 # followed by a tie block: the winners come out dense and
                                 # ASCENDING BY KEY INDEX, which is what a merge level above
@@ -3996,8 +4122,24 @@ def build_ml4_monokernel(
                                 # (``split_keys`` reads ``indices`` through
                                 # ``index_page_slot``, a permutation-invariant gather).
                                 for d in range_constexpr(items):
-                                    win = gt[d] | (eq[d] & (eq_offsets[d] < need_eq))
-                                    pos = gt_offsets[d] + fx.min(eq_offsets[d], need_eq)
+                                    if const_expr(SEL_SPREAD):
+                                        # Ties rank across the row's leaves, and the
+                                        # leaves before this one hold the positions
+                                        # before its winners.
+                                        eq_rank = eq_base + eq_offsets[d]
+                                        win = gt[d] | (eq[d] & (eq_rank < need_eq))
+                                        pos = (
+                                            gt_base
+                                            + gt_offsets[d]
+                                            + fx.min(eq_rank, need_eq)
+                                        )
+                                    else:
+                                        win = gt[d] | (
+                                            eq[d] & (eq_offsets[d] < need_eq)
+                                        )
+                                        pos = gt_offsets[d] + fx.min(
+                                            eq_offsets[d], need_eq
+                                        )
                                     if win:
                                         if const_expr(level == DEPTH):
                                             bo.buffer_store(
@@ -4049,7 +4191,13 @@ def build_ml4_monokernel(
                                 gpu.barrier()
                                 if at_final:
                                     if tid == 0:
-                                        put(mb("indices_ready"), s, fx.Int32(1))
+                                        put(
+                                            mb("indices_ready"),
+                                            s * SEL_LEAVES + j
+                                            if const_expr(SEL_SPREAD)
+                                            else s,
+                                            fx.Int32(1),
+                                        )
                                 stamp(SEL_STAGE, tt, 4)
 
         # ================================== 5. sparse MLA split: 32 keys x 8 heads
@@ -4072,8 +4220,23 @@ def build_ml4_monokernel(
             if const_expr(with_indexer):
                 if sparse:
                     if wave == 0:
-                        if lane == 0:
-                            get(mb("indices_ready"), s)
+                        if const_expr(SEL_SPREAD):
+                            # Each leaf of the row writes its own winners.
+                            if lane < SEL_LEAVES:
+                                n_leaves = tree_lists(
+                                    row_position(s) + 1,
+                                    0,
+                                    LOCAL_INDEX_CAPACITY,
+                                    INDEX_FAN,
+                                )
+                                get(
+                                    mb("indices_ready"),
+                                    s * SEL_LEAVES
+                                    + fx.min(lane, fx.max(n_leaves, fx.Int32(1)) - 1),
+                                )
+                        else:
+                            if lane == 0:
+                                get(mb("indices_ready"), s)
                         # Only wave 0 consumes the compact index payload; its
                         # divergent ready poll reconverges before this acquire.
                         fx.memory_fence(

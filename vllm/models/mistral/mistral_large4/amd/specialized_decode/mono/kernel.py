@@ -515,6 +515,11 @@ def build_ml4_monokernel(
     # their epilogues; ``MONO_SCORE_QREG=0`` restores the per-row reads and
     # chains (bit-identical: the same operations per row, in the same order).
     SCORE_QREG = os.environ.get("MONO_SCORE_QREG", "1") == "1"
+    # A verify block's staged queries are laid out with each head's 16 chunks
+    # of 4 words XOR-permuted by the head, so the 16 heads one read spans hit
+    # different banks; ``MONO_SCORE_QSWZ=0`` keeps the linear layout
+    # (bit-identical: the same words, stored and read at other addresses).
+    SCORE_QSWZ = os.environ.get("MONO_SCORE_QSWZ", "1") == "1"
     QHEADS = (
         WAVES
         if (
@@ -2947,7 +2952,7 @@ def build_ml4_monokernel(
             def load_index_q8(head, k, row=0):
                 """Query elements k..k+7 of one head; ``row`` = which of the task's
                 staged rows (each ``INDEX_Q_ROWS // 2`` words)."""
-                base = (head * INDEX_DIM + k) // 2
+                base = q_lds_word((head * INDEX_DIM + k) // 2)
                 if const_expr(row):
                     base = base + row * (INDEX_Q_ROWS // 2)
                 words = fx.Vector.from_elements(
@@ -2988,6 +2993,16 @@ def build_ml4_monokernel(
                 else 1
             )
             NG = S // RB  # task groups: a row each, or a request each
+            QSWZ = SCORE_QSWZ and RB > 1
+
+            def q_lds_word(i):
+                """LDS word of staged query word ``i`` (head ``i // 64``): its chunk
+                of 4 words XOR the head mod 16 when QSWZ.  A query read takes one
+                chunk of 16 heads 64 words apart, i.e. one bank group unswizzled."""
+                if const_expr(not QSWZ):
+                    return i
+                return i ^ (((i >> 6) & 15) << 2)
+
             QP = (INDEX_Q_ROWS // 2) // THREADS  # staged query pairs a thread a row
             STAGE_BELOW = G if G % NG == 0 else N_INDEX_SPLIT * NG
             EARLY = SCORE_EARLY and index_fp8 and not indexer_cp
@@ -3148,7 +3163,9 @@ def build_ml4_monokernel(
                                         )
                                         q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
                                 q_slot = (
-                                    q_pair if r == 0 else r * (QP * THREADS) + q_pair
+                                    q_lds_word(q_pair)
+                                    if r == 0
+                                    else r * (QP * THREADS) + q_lds_word(q_pair)
                                 )
                                 lds_st(xs, q_slot, bf16_pair(q0, q1))
                     gpu.barrier()
